@@ -231,7 +231,8 @@ async fn run(options: Opt) -> Result<()> {
             .map_err(|e| anyhow!("failed to read response: {}", e))?;
         let duration = response_start.elapsed();
         eprintln!(
-            "response received in {:?} - {} KiB/s",
+            "{} bytes response received in {:?} - {} KiB/s",
+            resp.len(),
             duration,
             resp.len() as f32 / (duration_secs(&duration) * 1024.0)
         );

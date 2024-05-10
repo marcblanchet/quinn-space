@@ -10,6 +10,7 @@ use std::{
     sync::Arc,
 };
 use std::time::Duration;
+use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
@@ -322,22 +323,41 @@ fn process_get(root: &Path, x: &[u8]) -> Result<Vec<u8>> {
     let path = Path::new(&path);
     let mut real_path = PathBuf::from(root);
     let mut components = path.components();
+
     match components.next() {
         Some(path::Component::RootDir) => {}
         _ => {
             bail!("path must be absolute");
         }
     }
+
     for c in components {
         match c {
             path::Component::Normal(x) => {
                 real_path.push(x);
-            }
+            },
             x => {
                 bail!("illegal component in path: {:?}", x);
             }
         }
     }
-    let data = fs::read(&real_path).context("failed reading file")?;
-    Ok(data)
+
+    if real_path.parent().unwrap().to_str().unwrap() == "./gen" {
+        let size_str = real_path.file_name().unwrap().to_str().unwrap();
+        match u64::from_str(size_str) {
+            Ok(s) => {
+                Ok(gen_data(s))
+            },
+            _ => { bail!("Cannot parse gen size"); }
+        }
+    } else {
+        Ok(fs::read(&real_path).context("failed reading file")?)
+    }
+}
+
+fn gen_data(size: u64) -> Vec<u8>
+{
+    let mut vec = Vec::<u8>::new();
+    vec.resize(size as usize, 0);
+    return vec;
 }
