@@ -21,6 +21,7 @@ use proto::congestion::{BbrConfig, NoCCConfig};
 use proto::{AckFrequencyConfig, MtuDiscoveryConfig, VarInt};
 
 mod common;
+mod dtn;
 
 #[derive(Parser, Debug)]
 #[clap(name = "server")]
@@ -64,6 +65,10 @@ struct Opt {
     // deep space usage, where delays and disruptions can be in order of minutes, hours, days
     #[clap(long = "dtn")]
     dtn: bool,
+
+    //Immediately abort the transfer if lost bytes are detected on path
+    #[clap(long = "abort_on_lost")]
+    abort_on_lost: Option<bool>,
 }
 
 fn main() {
@@ -220,7 +225,7 @@ async fn run(options: Opt) -> Result<()> {
     while let Some(conn) = endpoint.accept().await {
         eprintln!("connection incoming");
         eprintln!(" clock: {:?}", Utc::now());
-        let fut = handle_connection(root.clone(), conn);
+        let fut = handle_connection(root.clone(), conn, options.abort_on_lost);
         tokio::spawn(async move {
             if let Err(e) = fut.await {
                 error!("connection failed: {reason}", reason = e.to_string())
@@ -231,8 +236,15 @@ async fn run(options: Opt) -> Result<()> {
     Ok(())
 }
 
-async fn handle_connection(root: Arc<Path>, conn: quinn::Connecting) -> Result<()> {
-    let connection = conn.await?;
+async fn handle_connection(root: Arc<Path>, conn: quinn::Connecting, abort_on_lost: Option<bool>) -> Result<()> {
+    let connection = Arc::new(conn.await?);
+    match abort_on_lost {
+        Some(true) => {
+            tokio::task::spawn(dtn::lost_bytes_monitor(Arc::downgrade(&connection)));
+        }
+        _ => {}
+    }
+
     let span = info_span!(
         "connection",
         remote = %connection.remote_address(),

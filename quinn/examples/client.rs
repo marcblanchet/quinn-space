@@ -22,6 +22,7 @@ use proto::{VarInt};
 use chrono::Utc;
 
 mod common;
+mod dtn;
 
 /// HTTP/0.9 over QUIC client
 #[derive(Parser, Debug)]
@@ -75,6 +76,10 @@ struct Opt {
     //to simulate a single connection with multiple http requests: repeat the same request
     #[clap(long = "repeat")]
     repeat: Option<u32>,
+
+    //Immediately abort the transfer if lost bytes are detected on path
+    #[clap(long = "abort_on_lost")]
+    abort_on_lost: Option<bool>,
 }
 
 fn main() {
@@ -194,10 +199,18 @@ async fn run(options: Opt) -> Result<()> {
 
     eprintln!("connecting to {host} at {remote}");
     eprintln!(" clock: {:?}", Utc::now());
-    let conn = endpoint
+    let conn = Arc::new(endpoint
         .connect(remote, host)?
         .await
-        .map_err(|e| anyhow!("failed to connect: {}", e))?;
+        .map_err(|e| anyhow!("failed to connect: {}", e))?);
+
+    match options.abort_on_lost {
+        Some(true) => {
+            tokio::task::spawn(dtn::lost_bytes_monitor(Arc::downgrade(&conn)));
+        }
+        _ => {}
+    }
+
     eprintln!("connected at {:?}", start.elapsed());
     eprintln!(" clock: {:?}", Utc::now());
 
