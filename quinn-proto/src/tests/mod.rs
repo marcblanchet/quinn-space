@@ -23,6 +23,8 @@ use crate::{
 mod util;
 use util::*;
 
+mod dtn;
+
 #[test]
 fn version_negotiate_server() {
     let _guard = subscribe();

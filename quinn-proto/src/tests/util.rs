@@ -285,7 +285,7 @@ pub(super) struct TestEndpoint {
     socket: Option<UdpSocket>,
     timeout: Option<Instant>,
     pub(super) outbound: VecDeque<(Transmit, Bytes)>,
-    delayed: VecDeque<(Transmit, Bytes)>,
+    pub(super) delayed: VecDeque<(Transmit, Bytes)>,
     pub(super) inbound: VecDeque<(Instant, Option<EcnCodepoint>, BytesMut)>,
     accepted: Option<ConnectionHandle>,
     pub(super) connections: HashMap<ConnectionHandle, Connection>,
