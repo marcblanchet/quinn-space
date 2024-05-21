@@ -150,7 +150,8 @@ impl Pair {
             if let Some(ref socket) = self.client.socket {
                 socket.send_to(&buffer, packet.destination).unwrap();
             }
-            if self.server.addr == packet.destination {
+            if self.server.addr == packet.destination
+                && self.server.inbound.len() < self.server.max_buffers_len.unwrap_or(usize::MAX) {
                 let ecn = set_congestion_experienced(packet.ecn, self.congestion_experienced);
                 self.server.inbound.push_back((
                     self.time + self.latency,
@@ -174,7 +175,8 @@ impl Pair {
             if let Some(ref socket) = self.server.socket {
                 socket.send_to(&buffer, packet.destination).unwrap();
             }
-            if self.client.addr == packet.destination {
+            if self.client.addr == packet.destination
+                && self.client.inbound.len() < self.client.max_buffers_len.unwrap_or(usize::MAX) {
                 let ecn = set_congestion_experienced(packet.ecn, self.congestion_experienced);
                 self.client.inbound.push_back((
                     self.time + self.latency,
@@ -292,6 +294,7 @@ pub(super) struct TestEndpoint {
     conn_events: HashMap<ConnectionHandle, VecDeque<ConnectionEvent>>,
     pub(super) captured_packets: Vec<Vec<u8>>,
     pub(super) capture_inbound_packets: bool,
+    pub(super) max_buffers_len: Option<usize>,
 }
 
 impl TestEndpoint {
@@ -318,6 +321,7 @@ impl TestEndpoint {
             conn_events: HashMap::default(),
             captured_packets: Vec::new(),
             capture_inbound_packets: false,
+            max_buffers_len: None,
         }
     }
 
@@ -361,6 +365,7 @@ impl TestEndpoint {
                         let size = transmit.size;
                         self.outbound
                             .extend(split_transmit(transmit, buf.split_to(size).freeze()));
+                        self.outbound.truncate(self.max_buffers_len.unwrap_or(usize::MAX))
                     }
                 }
             }
@@ -392,6 +397,7 @@ impl TestEndpoint {
                     let size = transmit.size;
                     self.outbound
                         .extend(split_transmit(transmit, buf.split_to(size).freeze()));
+                    self.outbound.truncate(self.max_buffers_len.unwrap_or(usize::MAX))
                 }
                 self.timeout = conn.poll_timeout();
             }

@@ -64,39 +64,42 @@ fn info_stats(stats: ConnectionStats, side: &str) {
 fn no_cc_no_lost() {
     let _guard = subscribe();
     let mut pair = new_dtn_pair();
+
+    // Drive client side only for 10MB send
+    const TRANSFER_SIZE :usize = 10 * 1024 * 1024;
+
+    // Choose incoming and outgoing buffers large enough to hold TRANSFER_SIZE
+    pair.client.max_buffers_len = Some(TRANSFER_SIZE / 1024);
+    pair.server.max_buffers_len = Some(TRANSFER_SIZE / 1024);
+
     let (client_ch, server_ch) = pair.connect_with(client_config());
     // pair::connect_with() calls drive() internally 
     let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
     info!("Connection established.");
 
-    // Drive client side only for 100MB send
-    const CHUNK_SIZE: usize = 100*1024*1024;
     {
         let mut send = pair.client_send(client_ch, s);
-        let c_n = send.write(&[42; CHUNK_SIZE]).unwrap();
-        assert!(c_n == CHUNK_SIZE);
+        let c_n = send.write(&[42; TRANSFER_SIZE]).unwrap();
+        assert!(c_n == TRANSFER_SIZE);
     }
-    pair.client_send(client_ch, s).finish().unwrap();
-
-    pair.drive_client();
-
-    let client_stats = pair.client_conn_mut(client_ch).stats();
-    let server_stats = pair.server_conn_mut(server_ch).stats();
-    info_stats(client_stats, "client");
-    info_stats(server_stats, "server");
-    info!("Client inbound length {}", pair.client.inbound.len());
-    info!("Server inbound length {}", pair.server.inbound.len());
-
-    info!("Client delayed length {}", pair.client.delayed.len());
-    info!("Server delayed length {}", pair.server.delayed.len());
-
-    info!("Client outbound length {}", pair.client.outbound.len());
-    info!("Server outbound length {}", pair.server.outbound.len());
-
     pair.drive();
 
+    // There is no retransmission because the buffer is large enough.
     assert!(pair.client_conn_mut(client_ch).stats().path.lost_bytes == 0);
-    assert!(pair.server_conn_mut(client_ch).stats().path.lost_bytes == 0);
+    assert!(pair.server_conn_mut(server_ch).stats().path.lost_bytes == 0);
+
+    // Shrink buffer size
+    pair.client.max_buffers_len = Some(pair.client.max_buffers_len.unwrap() / (2 as usize));
+
+    {
+        let mut send = pair.client_send(client_ch, s);
+        let c_n = send.write(&[42; TRANSFER_SIZE]).unwrap();
+        assert!(c_n == TRANSFER_SIZE);
+    }
+    pair.drive();
+
+    // Lost is observed
+    assert!(pair.client_conn_mut(client_ch).stats().path.lost_bytes != 0);
 
     // Drive close
     info!("closing.");
