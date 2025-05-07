@@ -11,8 +11,6 @@ use std::{
 };
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
-use chrono::Utc;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use proto::crypto::rustls::QuicServerConfig;
@@ -111,9 +109,6 @@ async fn run(options: Opt) -> Result<()> {
             rustls_pemfile::certs(&mut &*cert_chain)
                 .collect::<Result<_, _>>()
                 .context("invalid PEM-encoded certificate")?
-                .into_iter()
-                .map(rustls::Certificate)
-                .collect()
         };
 
         (cert_chain, key)
@@ -142,14 +137,10 @@ async fn run(options: Opt) -> Result<()> {
                 bail!("failed to read certificate: {}", e);
             }
         };
-
-        let key = rustls::PrivateKey(key);
-        let cert = rustls::Certificate(cert);
         (vec![cert], key)
     };
 
     let mut server_crypto = rustls::ServerConfig::builder()
-        .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
     server_crypto.alpn_protocols = common::ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
@@ -204,10 +195,6 @@ async fn run(options: Opt) -> Result<()> {
     }
     if let Some(initial_rtt) = options.initial_rtt {
         transport_config.initial_rtt(Duration::new(initial_rtt,0));
-    }
-
-    if options.stateless_retry {
-        server_config.use_retry(true);
     }
 
     let root = Arc::<Path>::from(options.root.clone());
