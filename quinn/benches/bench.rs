@@ -4,7 +4,8 @@ use std::{
     thread,
 };
 
-use bencher::{benchmark_group, benchmark_main, Bencher};
+use bencher::{Bencher, benchmark_group, benchmark_main};
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use tokio::runtime::{Builder, Runtime};
 use tracing::error_span;
 use tracing_futures::Instrument as _;
@@ -53,7 +54,9 @@ fn send_data(bench: &mut Bencher, data: &'static [u8], concurrent_streams: usize
             handles.push(runtime.spawn(async move {
                 let mut stream = client.open_uni().await.unwrap();
                 stream.write_all(data).await.unwrap();
-                stream.finish().await.unwrap();
+                stream.finish().unwrap();
+                // Wait for stream to close
+                _ = stream.stopped().await;
             }));
         }
 
@@ -76,21 +79,20 @@ struct Context {
 impl Context {
     fn new() -> Self {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let key = rustls::PrivateKey(cert.serialize_private_key_der());
-        let cert = rustls::Certificate(cert.serialize_der().unwrap());
+        let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let cert = CertificateDer::from(cert.cert);
 
         let mut server_config =
-            quinn::ServerConfig::with_single_cert(vec![cert.clone()], key).unwrap();
+            quinn::ServerConfig::with_single_cert(vec![cert.clone()], key.into()).unwrap();
         let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
         transport_config.max_concurrent_uni_streams(1024_u16.into());
 
         let mut roots = rustls::RootCertStore::empty();
-        roots.add(&cert).unwrap();
+        roots.add(cert).unwrap();
 
-        let client_config = quinn::ClientConfig::with_root_certificates(roots);
         Self {
             server_config,
-            client_config,
+            client_config: quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
         }
     }
 

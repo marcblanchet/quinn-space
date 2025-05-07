@@ -1,31 +1,77 @@
 use std::{
-    collections::{binary_heap::PeekMut, hash_map, BinaryHeap, VecDeque},
+    collections::{VecDeque, hash_map},
     convert::TryFrom,
     mem,
 };
 
-use bytes::{BufMut, BytesMut};
+use bytes::BufMut;
 use rustc_hash::FxHashMap;
 use tracing::{debug, trace};
 
 use super::{
-    push_pending, PendingLevel, Recv, Retransmits, Send, SendState, ShouldTransmit, StreamEvent,
+    PendingStreamsQueue, Recv, Retransmits, Send, SendState, ShouldTransmit, StreamEvent,
     StreamHalf, ThinRetransmits,
 };
 use crate::{
+    Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
     coding::BufMutExt,
     connection::stats::FrameStats,
     frame::{self, FrameStruct, StreamMetaVec},
     transport_parameters::TransportParameters,
-    Dir, Side, StreamId, TransportError, VarInt, MAX_STREAM_COUNT,
 };
+
+/// Wrapper around `Recv` that facilitates reusing `Recv` instances
+#[derive(Debug)]
+pub(super) enum StreamRecv {
+    /// A `Recv` that is ready to be opened
+    Free(Box<Recv>),
+    /// A `Recv` that has been opened
+    Open(Box<Recv>),
+}
+
+impl StreamRecv {
+    /// Returns a reference to the inner `Recv` if the stream is open
+    pub(super) fn as_open_recv(&self) -> Option<&Recv> {
+        match self {
+            Self::Open(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    // Returns a mutable reference to the inner `Recv` if the stream is open
+    pub(super) fn as_open_recv_mut(&mut self) -> Option<&mut Recv> {
+        match self {
+            Self::Open(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    // Returns the inner `Recv`
+    pub(super) fn into_inner(self) -> Box<Recv> {
+        match self {
+            Self::Free(r) | Self::Open(r) => r,
+        }
+    }
+
+    // Reinitialize the stream so the inner `Recv` can be reused
+    pub(super) fn free(self, initial_max_data: u64) -> Self {
+        match self {
+            Self::Free(_) => unreachable!("Self::Free on reinit()"),
+            Self::Open(mut recv) => {
+                recv.reinit(initial_max_data);
+                Self::Free(recv)
+            }
+        }
+    }
+}
 
 #[allow(unreachable_pub)] // fuzzing only
 pub struct StreamsState {
     pub(super) side: Side,
     // Set of streams that are currently open, or could be immediately opened by the peer
     pub(super) send: FxHashMap<StreamId, Option<Box<Send>>>,
-    pub(super) recv: FxHashMap<StreamId, Option<Box<Recv>>>,
+    pub(super) recv: FxHashMap<StreamId, Option<StreamRecv>>,
+    pub(super) free_recv: Vec<StreamRecv>,
     pub(super) next: [u64; 2],
     /// Maximum number of locally-initiated streams that may be opened over the lifetime of the
     /// connection so far, per direction
@@ -33,6 +79,8 @@ pub struct StreamsState {
     /// Maximum number of remotely-initiated streams that may be opened over the lifetime of the
     /// connection so far, per direction
     pub(super) max_remote: [u64; 2],
+    /// Value of `max_remote` most recently transmitted to the peer in a `MAX_STREAMS` frame
+    sent_max_remote: [u64; 2],
     /// Number of streams that we've given the peer permission to open and which aren't fully closed
     pub(super) allocated_remote_count: [u64; 2],
     /// Size of the desired stream flow control window. May be smaller than `allocated_remote_count`
@@ -52,8 +100,8 @@ pub struct StreamsState {
     /// This differs from `self.send.len()` in that it does not include streams that the peer is
     /// permitted to open but which have not yet been opened.
     pub(super) send_streams: usize,
-    /// Streams with outgoing data queued
-    pub(super) pending: BinaryHeap<PendingLevel>,
+    /// Streams with outgoing data queued, sorted by priority
+    pub(super) pending: PendingStreamsQueue,
 
     events: VecDeque<StreamEvent>,
     /// Streams blocked on connection-level flow control or stream window space
@@ -79,8 +127,6 @@ pub struct StreamsState {
     pub(super) send_window: u64,
     /// Configured upper bound for how much unacked data the peer can send us per stream
     pub(super) stream_receive_window: u64,
-    /// Whether the corresponding `max_remote` has increased
-    max_streams_dirty: [bool; 2],
 
     // Pertinent state from the TransportParameters supplied by the peer
     initial_max_stream_data_uni: VarInt,
@@ -105,9 +151,11 @@ impl StreamsState {
             side,
             send: FxHashMap::default(),
             recv: FxHashMap::default(),
+            free_recv: Vec::new(),
             next: [0, 0],
             max: [0, 0],
             max_remote: [max_remote_bi.into(), max_remote_uni.into()],
+            sent_max_remote: [max_remote_bi.into(), max_remote_uni.into()],
             allocated_remote_count: [max_remote_bi.into(), max_remote_uni.into()],
             max_concurrent_remote_count: [max_remote_bi.into(), max_remote_uni.into()],
             flow_control_adjusted: false,
@@ -115,7 +163,7 @@ impl StreamsState {
             opened: [false, false],
             next_reported_remote: [0, 0],
             send_streams: 0,
-            pending: BinaryHeap::new(),
+            pending: PendingStreamsQueue::new(),
             events: VecDeque::new(),
             connection_blocked: Vec::new(),
             max_data: 0,
@@ -127,7 +175,6 @@ impl StreamsState {
             unacked_data: 0,
             send_window,
             stream_receive_window: stream_receive_window.into(),
-            max_streams_dirty: [false, false],
             initial_max_stream_data_uni: 0u32.into(),
             initial_max_stream_data_bidi_local: 0u32.into(),
             initial_max_stream_data_bidi_remote: 0u32.into(),
@@ -169,7 +216,6 @@ impl StreamsState {
         }
         self.allocated_remote_count[dir as usize] += new_count;
         self.max_remote[dir as usize] += new_count;
-        self.max_streams_dirty[dir as usize] = new_count != 0;
     }
 
     pub(crate) fn zero_rtt_rejected(&mut self) {
@@ -188,7 +234,8 @@ impl StreamsState {
 
             // If 0-RTT was rejected, any flow control frames we sent were lost.
             if self.flow_control_adjusted {
-                self.max_streams_dirty[dir as usize] = true;
+                // Conservative approximation of whatever we sent in transport parameters
+                self.sent_max_remote[dir as usize] = 0;
             }
         }
 
@@ -240,8 +287,8 @@ impl StreamsState {
 
         // Stopped streams become closed instantly on FIN, so check whether we need to clean up
         if closed {
-            self.recv.remove(&id);
-            self.stream_freed(id, StreamHalf::Recv);
+            let rs = self.recv.remove(&id).flatten().unwrap();
+            self.stream_recv_freed(id, rs);
         }
 
         // We don't buffer data on stopped streams, so issue flow control credit immediately
@@ -293,12 +340,12 @@ impl StreamsState {
         let end = rs.end;
         if stopped {
             // Stopped streams should be disposed immediately on reset
-            self.recv.remove(&id);
-            self.stream_freed(id, StreamHalf::Recv);
+            let rs = self.recv.remove(&id).flatten().unwrap();
+            self.stream_recv_freed(id, rs);
         }
         self.on_stream_frame(!stopped, id);
 
-        // Update flow control
+        // Update connection-level flow control
         Ok(if bytes_read != final_offset.into_inner() {
             // bytes_read is always <= end, so this won't underflow.
             self.data_recvd = self
@@ -345,13 +392,11 @@ impl StreamsState {
     /// Whether any stream data is queued, regardless of control frames
     pub(crate) fn can_send_stream_data(&self) -> bool {
         // Reset streams may linger in the pending stream list, but will never produce stream frames
-        self.pending.iter().any(|level| {
-            level.queue.borrow().iter().any(|id| {
-                self.send
-                    .get(id)
-                    .and_then(|s| s.as_ref())
-                    .map_or(false, |s| !s.is_reset())
-            })
+        self.pending.iter().any(|stream| {
+            self.send
+                .get(&stream.id)
+                .and_then(|s| s.as_ref())
+                .is_some_and(|s| !s.is_reset())
         })
     }
 
@@ -360,12 +405,13 @@ impl StreamsState {
         self.recv
             .get(&id)
             .and_then(|s| s.as_ref())
-            .map_or(false, |s| s.receiving_unknown_size())
+            .and_then(|s| s.as_open_recv())
+            .is_some_and(|s| s.can_send_flow_control())
     }
 
     pub(in crate::connection) fn write_control_frames(
         &mut self,
-        buf: &mut BytesMut,
+        buf: &mut Vec<u8>,
         pending: &mut Retransmits,
         retransmits: &mut ThinRetransmits,
         stats: &mut FrameStats,
@@ -432,7 +478,7 @@ impl StreamsState {
             }
 
             retransmits.get_or_create().max_data = true;
-            buf.write(frame::Type::MAX_DATA);
+            buf.write(frame::FrameType::MAX_DATA);
             buf.write(max);
             stats.max_data += 1;
         }
@@ -444,11 +490,16 @@ impl StreamsState {
                 None => break,
             };
             pending.max_stream_data.remove(&id);
-            let rs = match self.recv.get_mut(&id).and_then(|s| s.as_mut()) {
+            let rs = match self
+                .recv
+                .get_mut(&id)
+                .and_then(|s| s.as_mut())
+                .and_then(|s| s.as_open_recv_mut())
+            {
                 Some(x) => x,
                 None => continue,
             };
-            if !rs.receiving_unknown_size() {
+            if !rs.can_send_flow_control() {
                 continue;
             }
             retransmits.get_or_create().max_stream_data.insert(id);
@@ -457,7 +508,7 @@ impl StreamsState {
             rs.record_sent_max_stream_data(max);
 
             trace!(stream = %id, max = max, "MAX_STREAM_DATA");
-            buf.write(frame::Type::MAX_STREAM_DATA);
+            buf.write(frame::FrameType::MAX_STREAM_DATA);
             buf.write(id);
             buf.write_var(max);
             stats.max_stream_data += 1;
@@ -471,15 +522,14 @@ impl StreamsState {
 
             pending.max_stream_id[dir as usize] = false;
             retransmits.get_or_create().max_stream_id[dir as usize] = true;
-            self.max_streams_dirty[dir as usize] = false;
+            self.sent_max_remote[dir as usize] = self.max_remote[dir as usize];
             trace!(
                 value = self.max_remote[dir as usize],
-                "MAX_STREAMS ({:?})",
-                dir
+                "MAX_STREAMS ({:?})", dir
             );
             buf.write(match dir {
-                Dir::Uni => frame::Type::MAX_STREAMS_UNI,
-                Dir::Bi => frame::Type::MAX_STREAMS_BIDI,
+                Dir::Uni => frame::FrameType::MAX_STREAMS_UNI,
+                Dir::Bi => frame::FrameType::MAX_STREAMS_BIDI,
             });
             buf.write_var(self.max_remote[dir as usize]);
             match dir {
@@ -491,8 +541,9 @@ impl StreamsState {
 
     pub(crate) fn write_stream_frames(
         &mut self,
-        buf: &mut BytesMut,
+        buf: &mut Vec<u8>,
         max_buf_size: usize,
+        fair: bool,
     ) -> StreamMetaVec {
         let mut stream_frames = StreamMetaVec::new();
         while buf.len() + frame::Stream::SIZE_BOUND < max_buf_size {
@@ -503,26 +554,14 @@ impl StreamsState {
                 break;
             }
 
-            let num_levels = self.pending.len();
-            let mut level = match self.pending.peek_mut() {
-                Some(x) => x,
-                None => break,
+            // Pop the stream of the highest priority that currently has pending data
+            // If the stream still has some pending data left after writing, it will be reinserted, otherwise not
+            let Some(stream) = self.pending.pop() else {
+                break;
             };
-            // Poppping data from the front of the queue, storing as much data
-            // as possible in a single frame, and enqueing sending further
-            // remaining data at the end of the queue helps with fairness.
-            // Other streams will have a chance to write data before we touch
-            // this stream again.
-            let id = match level.queue.get_mut().pop_front() {
-                Some(x) => x,
-                None => {
-                    debug_assert!(
-                        num_levels == 1,
-                        "An empty queue is only allowed for a single level"
-                    );
-                    break;
-                }
-            };
+
+            let id = stream.id;
+
             let stream = match self.send.get_mut(&id).and_then(|s| s.as_mut()) {
                 Some(s) => s,
                 // Stream was reset with pending data and the reset was acknowledged
@@ -547,24 +586,15 @@ impl StreamsState {
             }
 
             if stream.is_pending() {
-                if level.priority == stream.priority {
-                    // Enqueue for the same level
-                    level.queue.get_mut().push_back(id);
+                // If the stream still has pending data, reinsert it, possibly with an updated priority value
+                // Fairness with other streams is achieved by implementing round-robin scheduling,
+                // so that the other streams will have a chance to write data
+                // before we touch this stream again.
+                if fair {
+                    self.pending.push_pending(id, stream.priority);
                 } else {
-                    // Enqueue for a different level. If the current level is empty, drop it
-                    if level.queue.borrow().is_empty() && num_levels != 1 {
-                        // We keep the last level around even in empty form so that
-                        // the next insert doesn't have to reallocate the queue
-                        PeekMut::pop(level);
-                    } else {
-                        drop(level);
-                    }
-                    push_pending(&mut self.pending, id, stream.priority);
+                    self.pending.reinsert_pending(id, stream.priority);
                 }
-            } else if level.queue.borrow().is_empty() && num_levels != 1 {
-                // We keep the last level around even in empty form so that
-                // the next insert doesn't have to reallocate the queue
-                PeekMut::pop(level);
             }
 
             let meta = frame::StreamMeta { id, offsets, fin };
@@ -644,7 +674,7 @@ impl StreamsState {
             Some(x) => x,
         };
         if !stream.is_pending() {
-            push_pending(&mut self.pending, frame.id, stream.priority);
+            self.pending.push_pending(frame.id, stream.priority);
         }
         stream.fin_pending |= frame.fin;
         stream.pending.retransmit(frame.offsets);
@@ -664,7 +694,7 @@ impl StreamsState {
                     continue;
                 }
                 if !stream.is_pending() {
-                    push_pending(&mut self.pending, id, stream.priority);
+                    self.pending.push_pending(id, stream.priority);
                 }
                 stream.pending.retransmit_all_for_0rtt();
             }
@@ -770,8 +800,21 @@ impl StreamsState {
         self.events.pop_front()
     }
 
-    pub(crate) fn take_max_streams_dirty(&mut self, dir: Dir) -> bool {
-        mem::replace(&mut self.max_streams_dirty[dir as usize], false)
+    /// Queues MAX_STREAM_ID frames in `pending` if needed
+    ///
+    /// Returns whether any frames were queued.
+    pub(crate) fn queue_max_stream_id(&mut self, pending: &mut Retransmits) -> bool {
+        let mut queued = false;
+        for dir in Dir::iter() {
+            let diff = self.max_remote[dir as usize] - self.sent_max_remote[dir as usize];
+            // To reduce traffic, only announce updates if at least 1/8 of the flow control window
+            // has been consumed.
+            if diff > self.max_concurrent_remote_count[dir as usize] / 8 {
+                pending.max_stream_id[dir as usize] = true;
+                queued = true;
+            }
+        }
+        queued
     }
 
     /// Check for errors entailed by the peer's use of `id` as a send stream
@@ -840,7 +883,8 @@ impl StreamsState {
         }
         // bidirectional OR (unidirectional AND remote)
         if bi || remote {
-            assert!(self.recv.insert(id, None).is_none());
+            let recv = self.free_recv.pop();
+            assert!(self.recv.insert(id, recv).is_none());
         }
     }
 
@@ -892,6 +936,11 @@ impl StreamsState {
         }
     }
 
+    pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
+        self.free_recv.push(recv.free(self.stream_receive_window));
+        self.stream_freed(id, StreamHalf::Recv);
+    }
+
     pub(super) fn max_send_data(&self, id: StreamId) -> VarInt {
         let remote = self.side != id.initiator();
         match id.dir() {
@@ -914,18 +963,26 @@ pub(super) fn get_or_insert_send(
 #[inline]
 pub(super) fn get_or_insert_recv(
     initial_max_data: u64,
-) -> impl Fn(&mut Option<Box<Recv>>) -> &mut Box<Recv> {
-    move |opt| opt.get_or_insert_with(|| Recv::new(initial_max_data))
+) -> impl FnMut(&mut Option<StreamRecv>) -> &mut Recv {
+    move |opt| {
+        *opt = opt.take().map(|s| match s {
+            StreamRecv::Free(recv) => StreamRecv::Open(recv),
+            s => s,
+        });
+        opt.get_or_insert_with(|| StreamRecv::Open(Recv::new(initial_max_data)))
+            .as_open_recv_mut()
+            .unwrap()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        connection::State as ConnState, connection::Streams, ReadableError, RecvStream, SendStream,
-        TransportErrorCode, WriteError,
+        ReadableError, RecvStream, SendStream, TransportErrorCode, WriteError,
+        connection::State as ConnState, connection::Streams,
     };
-    use bytes::{Bytes, BytesMut};
+    use bytes::Bytes;
 
     fn make(side: Side) -> StreamsState {
         StreamsState::new(
@@ -940,7 +997,14 @@ mod tests {
 
     #[test]
     fn trivial_flow_control() {
-        let mut client = make(Side::Client);
+        let mut client = StreamsState::new(
+            Side::Client,
+            1u32.into(),
+            1u32.into(),
+            1024 * 1024,
+            (1024 * 1024u32).into(),
+            (1024 * 1024u32).into(),
+        );
         let id = StreamId::new(Side::Server, Dir::Uni, 0);
         let initial_max = client.local_max_data;
         const MESSAGE_SIZE: usize = 2048;
@@ -1139,8 +1203,8 @@ mod tests {
         assert!(!recv.pending.max_data);
 
         assert!(recv.stop(0u32.into()).is_err());
-        assert_eq!(recv.read(true).err(), Some(ReadableError::UnknownStream));
-        assert_eq!(recv.read(false).err(), Some(ReadableError::UnknownStream));
+        assert_eq!(recv.read(true).err(), Some(ReadableError::ClosedStream));
+        assert_eq!(recv.read(false).err(), Some(ReadableError::ClosedStream));
 
         assert_eq!(client.local_max_data - initial_max, 32);
         assert_eq!(
@@ -1205,10 +1269,6 @@ mod tests {
             ShouldTransmit(false)
         );
         assert!(!client.recv.contains_key(&id), "stream state is freed");
-        assert!(
-            client.max_streams_dirty[Dir::Uni as usize],
-            "stream credit is issued"
-        );
         assert_eq!(client.max_remote[Dir::Uni as usize], prev_max + 1);
     }
 
@@ -1239,16 +1299,18 @@ mod tests {
 
         let error_code = 0u32.into();
         stream.state.received_stop_sending(id, error_code);
-        assert!(stream
-            .state
-            .events
-            .contains(&StreamEvent::Stopped { id, error_code }));
+        assert!(
+            stream
+                .state
+                .events
+                .contains(&StreamEvent::Stopped { id, error_code })
+        );
         stream.state.events.clear();
 
         assert_eq!(stream.write(&[]), Err(WriteError::Stopped(error_code)));
 
         stream.reset(0u32.into()).unwrap();
-        assert_eq!(stream.write(&[]), Err(WriteError::UnknownStream));
+        assert_eq!(stream.write(&[]), Err(WriteError::ClosedStream));
 
         // A duplicate frame is a no-op
         stream.state.received_stop_sending(id, error_code);
@@ -1317,14 +1379,14 @@ mod tests {
         high.set_priority(1).unwrap();
         high.write(b"high").unwrap();
 
-        let mut buf = BytesMut::with_capacity(40);
-        let meta = server.write_stream_frames(&mut buf, 40);
+        let mut buf = Vec::with_capacity(40);
+        let meta = server.write_stream_frames(&mut buf, 40, true);
         assert_eq!(meta[0].id, id_high);
         assert_eq!(meta[1].id, id_mid);
         assert_eq!(meta[2].id, id_low);
 
         assert!(!server.can_send_stream_data());
-        assert_eq!(server.pending.len(), 1);
+        assert_eq!(server.pending.len(), 0);
     }
 
     #[test]
@@ -1376,8 +1438,8 @@ mod tests {
         };
         high.set_priority(-1).unwrap();
 
-        let mut buf = BytesMut::with_capacity(1000);
-        let meta = server.write_stream_frames(&mut buf, 40);
+        let mut buf = Vec::with_capacity(1000);
+        let meta = server.write_stream_frames(&mut buf, 40, true);
         assert_eq!(meta.len(), 1);
         assert_eq!(meta[0].id, id_high);
 
@@ -1385,13 +1447,172 @@ mod tests {
         assert_eq!(server.pending.len(), 2);
 
         // Send the remaining data. The initial mid priority one should go first now
-        let meta = server.write_stream_frames(&mut buf, 1000);
+        let meta = server.write_stream_frames(&mut buf, 1000, true);
         assert_eq!(meta.len(), 2);
         assert_eq!(meta[0].id, id_mid);
         assert_eq!(meta[1].id, id_high);
 
         assert!(!server.can_send_stream_data());
-        assert_eq!(server.pending.len(), 1);
+        assert_eq!(server.pending.len(), 0);
+    }
+
+    #[test]
+    fn same_stream_priority() {
+        for fair in [true, false] {
+            let mut server = make(Side::Server);
+            server.set_params(&TransportParameters {
+                initial_max_streams_bidi: 3u32.into(),
+                initial_max_data: 300u32.into(),
+                initial_max_stream_data_bidi_remote: 300u32.into(),
+                ..TransportParameters::default()
+            });
+
+            let (mut pending, state) = (Retransmits::default(), ConnState::Established);
+            let mut streams = Streams {
+                state: &mut server,
+                conn_state: &state,
+            };
+
+            // a, b and c all have the same priority
+            let id_a = streams.open(Dir::Bi).unwrap();
+            let id_b = streams.open(Dir::Bi).unwrap();
+            let id_c = streams.open(Dir::Bi).unwrap();
+
+            let mut stream_a = SendStream {
+                id: id_a,
+                state: &mut server,
+                pending: &mut pending,
+                conn_state: &state,
+            };
+            stream_a.write(&[b'a'; 100]).unwrap();
+
+            let mut stream_b = SendStream {
+                id: id_b,
+                state: &mut server,
+                pending: &mut pending,
+                conn_state: &state,
+            };
+            stream_b.write(&[b'b'; 100]).unwrap();
+
+            let mut stream_c = SendStream {
+                id: id_c,
+                state: &mut server,
+                pending: &mut pending,
+                conn_state: &state,
+            };
+            stream_c.write(&[b'c'; 100]).unwrap();
+
+            let mut metas = vec![];
+            let mut buf = Vec::with_capacity(1024);
+
+            // loop until all the streams are written
+            loop {
+                let buf_len = buf.len();
+                let meta = server.write_stream_frames(&mut buf, buf_len + 40, fair);
+                if meta.is_empty() {
+                    break;
+                }
+                metas.extend(meta);
+            }
+
+            assert!(!server.can_send_stream_data());
+            assert_eq!(server.pending.len(), 0);
+
+            let stream_ids = metas.iter().map(|m| m.id).collect::<Vec<_>>();
+            if fair {
+                // When fairness is enabled, if we run out of buffer space to write out a stream,
+                // the stream is re-queued after all the streams with the same priority.
+                assert_eq!(
+                    stream_ids,
+                    vec![id_a, id_b, id_c, id_a, id_b, id_c, id_a, id_b, id_c]
+                );
+            } else {
+                // When fairness is disabled the stream is re-queued before all the other streams
+                // with the same priority.
+                assert_eq!(
+                    stream_ids,
+                    vec![id_a, id_a, id_a, id_b, id_b, id_b, id_c, id_c, id_c]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unfair_priority_bump() {
+        let mut server = make(Side::Server);
+        server.set_params(&TransportParameters {
+            initial_max_streams_bidi: 3u32.into(),
+            initial_max_data: 300u32.into(),
+            initial_max_stream_data_bidi_remote: 300u32.into(),
+            ..TransportParameters::default()
+        });
+
+        let (mut pending, state) = (Retransmits::default(), ConnState::Established);
+        let mut streams = Streams {
+            state: &mut server,
+            conn_state: &state,
+        };
+
+        // a, and b have the same priority, c has higher priority
+        let id_a = streams.open(Dir::Bi).unwrap();
+        let id_b = streams.open(Dir::Bi).unwrap();
+        let id_c = streams.open(Dir::Bi).unwrap();
+
+        let mut stream_a = SendStream {
+            id: id_a,
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &state,
+        };
+        stream_a.write(&[b'a'; 100]).unwrap();
+
+        let mut stream_b = SendStream {
+            id: id_b,
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &state,
+        };
+        stream_b.write(&[b'b'; 100]).unwrap();
+
+        let mut metas = vec![];
+        let mut buf = Vec::with_capacity(1024);
+
+        // Write the first chunk of stream_a
+        let buf_len = buf.len();
+        let meta = server.write_stream_frames(&mut buf, buf_len + 40, false);
+        assert!(!meta.is_empty());
+        metas.extend(meta);
+
+        // Queue stream_c which has higher priority
+        let mut stream_c = SendStream {
+            id: id_c,
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &state,
+        };
+        stream_c.set_priority(1).unwrap();
+        stream_c.write(&[b'b'; 100]).unwrap();
+
+        // loop until all the streams are written
+        loop {
+            let buf_len = buf.len();
+            let meta = server.write_stream_frames(&mut buf, buf_len + 40, false);
+            if meta.is_empty() {
+                break;
+            }
+            metas.extend(meta);
+        }
+
+        assert!(!server.can_send_stream_data());
+        assert_eq!(server.pending.len(), 0);
+
+        let stream_ids = metas.iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(
+            stream_ids,
+            // stream_c bumps stream_b but doesn't bump stream_a which had already been partly
+            // written out
+            vec![id_a, id_a, id_a, id_c, id_c, id_c, id_b, id_b, id_b]
+        );
     }
 
     #[test]
@@ -1492,8 +1713,6 @@ mod tests {
         };
         stream.stop(0u32.into()).unwrap();
 
-        assert!(client.max_streams_dirty[Dir::Uni as usize]);
-
         // Open stream 128
         assert_eq!(
             client.received(
@@ -1545,8 +1764,6 @@ mod tests {
         // Relax limit by one
         client.set_max_concurrent(Dir::Uni, 129u32.into());
 
-        assert!(client.max_streams_dirty[Dir::Uni as usize]);
-
         // Open stream 128
         assert_eq!(
             client.received(
@@ -1590,7 +1807,6 @@ mod tests {
             pending: &mut pending,
         };
         stream.stop(0u32.into()).unwrap();
-        assert!(!client.max_streams_dirty[Dir::Uni as usize]);
 
         // Try to open stream 128, still exceeding limit
         assert_eq!(
@@ -1625,8 +1841,6 @@ mod tests {
             pending: &mut pending,
         };
         stream.stop(0u32.into()).unwrap();
-
-        assert!(client.max_streams_dirty[Dir::Uni as usize]);
 
         // Open stream 128
         assert_eq!(

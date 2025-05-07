@@ -3,15 +3,16 @@ use std::{
     io,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
     time::Instant,
 };
 
 use async_io::{Async, Timer};
 
-use super::{AsyncTimer, AsyncUdpSocket, Runtime};
+use super::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPollHelper};
 
 #[cfg(feature = "smol")]
+// Due to MSRV, we must specify `self::` where there's crate/module ambiguity
 pub use self::smol::SmolRuntime;
 
 #[cfg(feature = "smol")]
@@ -41,6 +42,7 @@ mod smol {
 }
 
 #[cfg(feature = "async-std")]
+// Due to MSRV, we must specify `self::` where there's crate/module ambiguity
 pub use self::async_std::AsyncStdRuntime;
 
 #[cfg(feature = "async-std")]
@@ -89,19 +91,21 @@ impl UdpSocket {
     fn new(sock: std::net::UdpSocket) -> io::Result<Self> {
         Ok(Self {
             inner: udp::UdpSocketState::new((&sock).into())?,
-            io: Async::new(sock)?,
+            io: Async::new_nonblocking(sock)?,
         })
     }
 }
 
 impl AsyncUdpSocket for UdpSocket {
-    fn poll_send(&self, cx: &mut Context, transmits: &[udp::Transmit]) -> Poll<io::Result<usize>> {
-        loop {
-            ready!(self.io.poll_writable(cx))?;
-            if let Ok(res) = self.inner.send((&self.io).into(), transmits) {
-                return Poll::Ready(Ok(res));
-            }
-        }
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn super::UdpPoller>> {
+        Box::pin(UdpPollHelper::new(move || {
+            let socket = self.clone();
+            async move { socket.io.writable().await }
+        }))
+    }
+
+    fn try_send(&self, transmit: &udp::Transmit) -> io::Result<()> {
+        self.inner.send((&self.io).into(), transmit)
     }
 
     fn poll_recv(

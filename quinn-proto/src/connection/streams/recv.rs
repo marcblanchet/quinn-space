@@ -5,12 +5,14 @@ use thiserror::Error;
 use tracing::debug;
 
 use super::state::get_or_insert_recv;
-use super::{Retransmits, ShouldTransmit, StreamHalf, StreamId, StreamsState, UnknownStream};
+use super::{ClosedStream, Retransmits, ShouldTransmit, StreamId, StreamsState};
 use crate::connection::assembler::{Assembler, Chunk, IllegalOrderedRead};
-use crate::{frame, TransportError, VarInt};
+use crate::connection::streams::state::StreamRecv;
+use crate::{TransportError, VarInt, frame};
 
 #[derive(Debug, Default)]
 pub(super) struct Recv {
+    // NB: when adding or removing fields, remember to update `reinit`.
     state: RecvState,
     pub(super) assembler: Assembler,
     sent_max_stream_data: u64,
@@ -27,6 +29,15 @@ impl Recv {
             end: 0,
             stopped: false,
         })
+    }
+
+    /// Reset to the initial state
+    pub(super) fn reinit(&mut self, initial_max_data: u64) {
+        self.state = RecvState::default();
+        self.assembler.reinit();
+        self.sent_max_stream_data = initial_max_data;
+        self.end = 0;
+        self.stopped = false;
     }
 
     /// Process a STREAM frame
@@ -64,18 +75,18 @@ impl Recv {
         }
 
         self.end = self.end.max(end);
+        // Don't bother storing data or releasing stream-level flow control credit if the stream's
+        // already stopped
         if !self.stopped {
             self.assembler.insert(frame.offset, frame.data, payload_len);
-        } else {
-            self.assembler.set_bytes_read(end);
         }
 
         Ok((new_bytes, frame.fin && self.stopped))
     }
 
-    pub(super) fn stop(&mut self) -> Result<(u64, ShouldTransmit), UnknownStream> {
+    pub(super) fn stop(&mut self) -> Result<(u64, ShouldTransmit), ClosedStream> {
         if self.stopped {
-            return Err(UnknownStream { _private: () });
+            return Err(ClosedStream { _private: () });
         }
 
         self.stopped = true;
@@ -107,7 +118,7 @@ impl Recv {
         // smaller than `stream_receive_window` in order to make sure the stream
         // does not get stuck.
         let diff = max_stream_data - self.sent_max_stream_data;
-        let transmit = self.receiving_unknown_size() && diff >= (stream_receive_window / 8);
+        let transmit = self.can_send_flow_control() && diff >= (stream_receive_window / 8);
         (max_stream_data, ShouldTransmit(transmit))
     }
 
@@ -122,8 +133,22 @@ impl Recv {
         }
     }
 
-    pub(super) fn receiving_unknown_size(&self) -> bool {
+    /// Whether the total amount of data that the peer will send on this stream is unknown
+    ///
+    /// True until we've received either a reset or the final frame.
+    ///
+    /// Implies that the sender might benefit from stream-level flow control updates, and we might
+    /// need to issue connection-level flow control updates due to flow control budget use by this
+    /// stream in the future, even if it's been stopped.
+    pub(super) fn final_offset_unknown(&self) -> bool {
         matches!(self.state, RecvState::Recv { size: None })
+    }
+
+    /// Whether stream-level flow control updates should be sent for this stream
+    pub(super) fn can_send_flow_control(&self) -> bool {
+        // Stream-level flow control is redundant if the sender has already sent the whole stream,
+        // and moot if we no longer want data on this stream.
+        self.final_offset_unknown() && !self.stopped
     }
 
     /// Whether data is still being accepted from the peer
@@ -151,7 +176,7 @@ impl Recv {
             if offset != final_offset.into_inner() {
                 return Err(TransportError::FINAL_SIZE_ERROR("inconsistent value"));
             }
-        } else if self.end > final_offset.into() {
+        } else if self.end > u64::from(final_offset) {
             return Err(TransportError::FINAL_SIZE_ERROR(
                 "lower than high water mark",
             ));
@@ -171,6 +196,13 @@ impl Recv {
         // reset streams.
         self.assembler.clear();
         Ok(true)
+    }
+
+    pub(super) fn reset_code(&self) -> Option<VarInt> {
+        match self.state {
+            RecvState::ResetRecvd { error_code, .. } => Some(error_code),
+            _ => None,
+        }
     }
 
     /// Compute the amount of flow control credit consumed, or return an error if more was consumed
@@ -199,7 +231,17 @@ impl Recv {
     }
 }
 
-/// Chunks
+/// Chunks returned from [`RecvStream::read()`][crate::RecvStream::read].
+///
+/// ### Note: Finalization Needed
+/// Bytes read from the stream are not released from the congestion window until
+/// either [`Self::finalize()`] is called, or this type is dropped.
+///
+/// It is recommended that you call [`Self::finalize()`] because it returns a flag
+/// telling you whether reading from the stream has resulted in the need to transmit a packet.
+///
+/// If this type is leaked, the stream will remain blocked on the remote peer until
+/// another read from the stream is done.
 pub struct Chunks<'a> {
     id: StreamId,
     ordered: bool,
@@ -218,13 +260,13 @@ impl<'a> Chunks<'a> {
     ) -> Result<Self, ReadableError> {
         let mut entry = match streams.recv.entry(id) {
             Entry::Occupied(entry) => entry,
-            Entry::Vacant(_) => return Err(ReadableError::UnknownStream),
+            Entry::Vacant(_) => return Err(ReadableError::ClosedStream),
         };
 
         let mut recv =
             match get_or_insert_recv(streams.stream_receive_window)(entry.get_mut()).stopped {
-                true => return Err(ReadableError::UnknownStream),
-                false => entry.remove().unwrap(), // this can't fail due to the previous get_or_insert_with
+                true => return Err(ReadableError::ClosedStream),
+                false => entry.remove().unwrap().into_inner(), // this can't fail due to the previous get_or_insert_with
             };
 
         recv.assembler.ensure_ordering(ordered)?;
@@ -261,14 +303,24 @@ impl<'a> Chunks<'a> {
         match rs.state {
             RecvState::ResetRecvd { error_code, .. } => {
                 debug_assert_eq!(self.read, 0, "reset streams have empty buffers");
-                self.streams.stream_freed(self.id, StreamHalf::Recv);
-                self.state = ChunksState::Reset(error_code);
+                let state = mem::replace(&mut self.state, ChunksState::Reset(error_code));
+                // At this point if we have `rs` self.state must be `ChunksState::Readable`
+                let recv = match state {
+                    ChunksState::Readable(recv) => StreamRecv::Open(recv),
+                    _ => unreachable!("state must be ChunkState::Readable"),
+                };
+                self.streams.stream_recv_freed(self.id, recv);
                 Err(ReadError::Reset(error_code))
             }
             RecvState::Recv { size } => {
                 if size == Some(rs.end) && rs.assembler.bytes_read() == rs.end {
-                    self.streams.stream_freed(self.id, StreamHalf::Recv);
-                    self.state = ChunksState::Finished;
+                    let state = mem::replace(&mut self.state, ChunksState::Finished);
+                    // At this point if we have `rs` self.state must be `ChunksState::Readable`
+                    let recv = match state {
+                        ChunksState::Readable(recv) => StreamRecv::Open(recv),
+                        _ => unreachable!("state must be ChunkState::Readable"),
+                    };
+                    self.streams.stream_recv_freed(self.id, recv);
                     Ok(None)
                 } else {
                     // We don't need a distinct `ChunksState` variant for a blocked stream because
@@ -281,31 +333,30 @@ impl<'a> Chunks<'a> {
         }
     }
 
-    /// Finalize
+    /// Mark the read data as consumed from the stream.
+    ///
+    /// The number of read bytes will be released from the congestion window,
+    /// allowing the remote peer to send more data if it was previously blocked.
+    ///
+    /// If [`ShouldTransmit::should_transmit()`] returns `true`,
+    /// a packet needs to be sent to the peer informing them that the stream is unblocked.
+    /// This means that you should call [`Connection::poll_transmit()`][crate::Connection::poll_transmit]
+    /// and send the returned packet as soon as is reasonable, to unblock the remote peer.
     pub fn finalize(mut self) -> ShouldTransmit {
-        self.finalize_inner(false)
+        self.finalize_inner()
     }
 
-    fn finalize_inner(&mut self, drop: bool) -> ShouldTransmit {
+    fn finalize_inner(&mut self) -> ShouldTransmit {
         let state = mem::replace(&mut self.state, ChunksState::Finalized);
-        debug_assert!(
-            !drop || matches!(state, ChunksState::Finalized),
-            "finalize must be called before drop"
-        );
         if let ChunksState::Finalized = state {
             // Noop on repeated calls
             return ShouldTransmit(false);
         }
 
-        let mut should_transmit = false;
         // We issue additional stream ID credit after the application is notified that a previously
-        // open stream has finished or been reset and we've therefore disposed of its state.
-        if matches!(state, ChunksState::Finished | ChunksState::Reset(_))
-            && self.streams.side != self.id.initiator()
-        {
-            self.pending.max_stream_id[self.id.dir() as usize] = true;
-            should_transmit = true;
-        }
+        // open stream has finished or been reset and we've therefore disposed of its state, as
+        // recorded by `stream_freed` calls in `next`.
+        let mut should_transmit = self.streams.queue_max_stream_id(self.pending);
 
         // If the stream hasn't finished, we may need to issue stream-level flow control credit
         if let ChunksState::Readable(mut rs) = state {
@@ -315,7 +366,9 @@ impl<'a> Chunks<'a> {
                 self.pending.max_stream_data.insert(self.id);
             }
             // Return the stream to storage for future use
-            self.streams.recv.insert(self.id, Some(rs));
+            self.streams
+                .recv
+                .insert(self.id, Some(StreamRecv::Open(rs)));
         }
 
         // Issue connection-level flow control credit for any data we read regardless of state
@@ -326,9 +379,9 @@ impl<'a> Chunks<'a> {
     }
 }
 
-impl<'a> Drop for Chunks<'a> {
+impl Drop for Chunks<'_> {
     fn drop(&mut self) {
-        let _ = self.finalize_inner(true);
+        let _ = self.finalize_inner();
     }
 }
 
@@ -359,8 +412,8 @@ pub enum ReadError {
 #[derive(Debug, Error, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ReadableError {
     /// The stream has not been opened or was already stopped, finished, or reset
-    #[error("unknown stream")]
-    UnknownStream,
+    #[error("closed stream")]
+    ClosedStream,
     /// Attempted an ordered read following an unordered read
     ///
     /// Performing an unordered read allows discontinuities to arise in the receive buffer of a
@@ -384,5 +437,107 @@ enum RecvState {
 impl Default for RecvState {
     fn default() -> Self {
         Self::Recv { size: None }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use crate::{Dir, Side};
+
+    use super::*;
+
+    #[test]
+    fn reordered_frames_while_stopped() {
+        const INITIAL_BYTES: u64 = 3;
+        const INITIAL_OFFSET: u64 = 3;
+        const RECV_WINDOW: u64 = 8;
+        let mut s = Recv::new(RECV_WINDOW);
+        let mut data_recvd = 0;
+        // Receive bytes 3..6
+        let (new_bytes, is_closed) = s
+            .ingest(
+                frame::Stream {
+                    id: StreamId::new(Side::Client, Dir::Uni, 0),
+                    offset: INITIAL_OFFSET,
+                    fin: false,
+                    data: Bytes::from_static(&[0; INITIAL_BYTES as usize]),
+                },
+                123,
+                data_recvd,
+                data_recvd + 1024,
+            )
+            .unwrap();
+        data_recvd += new_bytes;
+        assert_eq!(new_bytes, INITIAL_OFFSET + INITIAL_BYTES);
+        assert!(!is_closed);
+
+        let (credits, transmit) = s.stop().unwrap();
+        assert!(transmit.should_transmit());
+        assert_eq!(
+            credits,
+            INITIAL_OFFSET + INITIAL_BYTES,
+            "full connection flow control credit is issued by stop"
+        );
+
+        let (max_stream_data, transmit) = s.max_stream_data(RECV_WINDOW);
+        assert!(!transmit.should_transmit());
+        assert_eq!(
+            max_stream_data, RECV_WINDOW,
+            "stream flow control credit isn't issued by stop"
+        );
+
+        // Receive byte 7
+        let (new_bytes, is_closed) = s
+            .ingest(
+                frame::Stream {
+                    id: StreamId::new(Side::Client, Dir::Uni, 0),
+                    offset: RECV_WINDOW - 1,
+                    fin: false,
+                    data: Bytes::from_static(&[0; 1]),
+                },
+                123,
+                data_recvd,
+                data_recvd + 1024,
+            )
+            .unwrap();
+        data_recvd += new_bytes;
+        assert_eq!(new_bytes, RECV_WINDOW - (INITIAL_OFFSET + INITIAL_BYTES));
+        assert!(!is_closed);
+
+        let (max_stream_data, transmit) = s.max_stream_data(RECV_WINDOW);
+        assert!(!transmit.should_transmit());
+        assert_eq!(
+            max_stream_data, RECV_WINDOW,
+            "stream flow control credit isn't issued after stop"
+        );
+
+        // Receive bytes 0..3
+        let (new_bytes, is_closed) = s
+            .ingest(
+                frame::Stream {
+                    id: StreamId::new(Side::Client, Dir::Uni, 0),
+                    offset: 0,
+                    fin: false,
+                    data: Bytes::from_static(&[0; INITIAL_OFFSET as usize]),
+                },
+                123,
+                data_recvd,
+                data_recvd + 1024,
+            )
+            .unwrap();
+        assert_eq!(
+            new_bytes, 0,
+            "reordered frames don't issue connection-level flow control for stopped streams"
+        );
+        assert!(!is_closed);
+
+        let (max_stream_data, transmit) = s.max_stream_data(RECV_WINDOW);
+        assert!(!transmit.should_transmit());
+        assert_eq!(
+            max_stream_data, RECV_WINDOW,
+            "stream flow control credit isn't issued after stop"
+        );
     }
 }

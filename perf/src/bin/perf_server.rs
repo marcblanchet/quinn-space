@@ -3,10 +3,11 @@ use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use quinn::TokioRuntime;
+use quinn::{TokioRuntime, crypto::rustls::QuicServerConfig};
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use tracing::{debug, error, info};
 
-use perf::{bind_socket, noprotection::NoProtectionServerConfig};
+use perf::{PERF_CIPHER_SUITES, bind_socket, noprotection::NoProtectionServerConfig};
 
 #[derive(Parser)]
 #[clap(name = "server")]
@@ -56,30 +57,33 @@ async fn run(opt: Opt) -> Result<()> {
         (Some(key), Some(cert)) => {
             let key = fs::read(key).context("reading key")?;
             let cert = fs::read(cert).expect("reading cert");
-
-            let mut certs = Vec::new();
-            for cert in rustls_pemfile::certs(&mut cert.as_ref()).context("parsing cert")? {
-                certs.push(rustls::Certificate(cert));
-            }
-
-            (rustls::PrivateKey(key), certs)
+            (
+                PrivatePkcs8KeyDer::from(key),
+                rustls_pemfile::certs(&mut cert.as_ref())
+                    .collect::<Result<_, _>>()
+                    .context("parsing cert")?,
+            )
         }
         _ => {
             let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
             (
-                rustls::PrivateKey(cert.serialize_private_key_der()),
-                vec![rustls::Certificate(cert.serialize_der().unwrap())],
+                PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()),
+                vec![CertificateDer::from(cert.cert)],
             )
         }
     };
 
-    let mut crypto = rustls::ServerConfig::builder()
-        .with_cipher_suites(perf::PERF_CIPHER_SUITES)
-        .with_safe_default_kx_groups()
+    let default_provider = rustls::crypto::ring::default_provider();
+    let provider = rustls::crypto::CryptoProvider {
+        cipher_suites: PERF_CIPHER_SUITES.into(),
+        ..default_provider
+    };
+
+    let mut crypto = rustls::ServerConfig::builder_with_provider(provider.into())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .unwrap()
         .with_no_client_auth()
-        .with_single_cert(cert, key)
+        .with_single_cert(cert, key.into())
         .unwrap();
     crypto.alpn_protocols = vec![b"perf".to_vec()];
 
@@ -90,18 +94,18 @@ async fn run(opt: Opt) -> Result<()> {
     let mut transport = quinn::TransportConfig::default();
     transport.initial_mtu(opt.initial_mtu);
 
-    let mut server_config = if opt.no_protection {
-        quinn::ServerConfig::with_crypto(Arc::new(NoProtectionServerConfig::new(Arc::new(crypto))))
-    } else {
-        quinn::ServerConfig::with_crypto(Arc::new(crypto))
-    };
-    server_config.transport_config(Arc::new(transport));
+    let crypto = Arc::new(QuicServerConfig::try_from(crypto)?);
+    let mut config = quinn::ServerConfig::with_crypto(match opt.no_protection {
+        true => Arc::new(NoProtectionServerConfig::new(crypto)),
+        false => crypto,
+    });
+    config.transport_config(Arc::new(transport));
 
     let socket = bind_socket(opt.listen, opt.send_buffer_size, opt.recv_buffer_size)?;
 
     let endpoint = quinn::Endpoint::new(
         Default::default(),
-        Some(server_config),
+        Some(config),
         socket,
         Arc::new(TokioRuntime),
     )
@@ -123,7 +127,7 @@ async fn run(opt: Opt) -> Result<()> {
     Ok(())
 }
 
-async fn handle(handshake: quinn::Connecting, opt: Arc<Opt>) -> Result<()> {
+async fn handle(handshake: quinn::Incoming, opt: Arc<Opt>) -> Result<()> {
     let connection = handshake.await.context("handshake failed")?;
     debug!("{} connected", connection.remote_address());
     tokio::try_join!(
@@ -211,7 +215,7 @@ async fn drain_stream(mut stream: quinn::RecvStream) -> Result<()> {
 }
 
 async fn respond(mut bytes: u64, mut stream: quinn::SendStream) -> Result<()> {
-    const DATA: [u8; 1024 * 1024] = [42; 1024 * 1024];
+    static DATA: [u8; 1024 * 1024] = [42; 1024 * 1024];
 
     while bytes > 0 {
         let chunk_len = bytes.min(DATA.len() as u64);

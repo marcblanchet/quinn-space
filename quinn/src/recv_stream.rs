@@ -1,19 +1,16 @@
 use std::{
-    future::Future,
+    future::{Future, poll_fn},
     io,
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
 };
 
 use bytes::Bytes;
-use proto::{Chunk, Chunks, ConnectionError, ReadableError, StreamId};
+use proto::{Chunk, Chunks, ClosedStream, ConnectionError, ReadableError, StreamId};
 use thiserror::Error;
 use tokio::io::ReadBuf;
 
-use crate::{
-    connection::{ConnectionRef, UnknownStream},
-    VarInt,
-};
+use crate::{VarInt, connection::ConnectionRef};
 
 /// A stream that can only be used to receive data
 ///
@@ -44,50 +41,6 @@ use crate::{
 /// i.e. ascending order by [`StreamId`]. For example, even if a sender first transmits on
 /// bidirectional stream 1, the first stream yielded by [`Connection::accept_bi`] on the receiver
 /// will be bidirectional stream 0.
-///
-/// ## Unexpected [`WriteError::Stopped`] in sender
-///
-/// When a stream is expected to be closed gracefully the sender should call
-/// [`SendStream::finish`].  However there is no guarantee the connected [`RecvStream`] will
-/// receive the "finished" notification in the same QUIC frame as the last frame which
-/// carried data.
-///
-/// Even if the application layer logic already knows it read all the data because it does
-/// its own framing, it should still read until it reaches the end of the [`RecvStream`].
-/// Otherwise it risks inadvertently calling [`RecvStream::stop`] if it drops the stream.
-/// And calling [`RecvStream::stop`] could result in the connected [`SendStream::finish`]
-/// call failing with a [`WriteError::Stopped`] error.
-///
-/// For example if exactly 10 bytes are to be read, you still need to explicitly read the
-/// end of the stream:
-///
-/// ```no_run
-/// # use quinn::{SendStream, RecvStream};
-/// # async fn func(
-/// #     mut send_stream: SendStream,
-/// #     mut recv_stream: RecvStream,
-/// # ) -> anyhow::Result<()>
-/// # {
-/// // In the sending task
-/// send_stream.write(&b"0123456789"[..]).await?;
-/// send_stream.finish().await?;
-///
-/// // In the receiving task
-/// let mut buf = [0u8; 10];
-/// let data = recv_stream.read_exact(&mut buf).await?;
-/// if recv_stream.read_to_end(0).await.is_err() {
-///     // Discard unexpected data and notify the peer to stop sending it
-///     let _ = recv_stream.stop(0u8.into());
-/// }
-/// # Ok(())
-/// # }
-/// ```
-///
-/// An alternative approach, used in HTTP/3, is to specify a particular error code used with `stop`
-/// that indicates graceful receiver-initiated stream shutdown, rather than a true error condition.
-///
-/// [`RecvStream::read_chunk`] could be used instead which does not take ownership and
-/// allows using an explicit call to [`RecvStream::stop`] with a custom error code.
 ///
 /// [`ReadError`]: crate::ReadError
 /// [`stop()`]: RecvStream::stop
@@ -141,14 +94,17 @@ impl RecvStream {
         .await
     }
 
-    /// Attempts to read from the stream into buf.
+    /// Attempts to read from the stream into the provided buffer
     ///
-    /// On success, returns Poll::Ready(Ok(num_bytes_read)) and places data in
-    /// the buf. If no data was read, it implies that EOF has been reached.
+    /// On success, returns `Poll::Ready(Ok(num_bytes_read))` and places data into `buf`. If this
+    /// returns zero bytes read (and `buf` has a non-zero length), that indicates that the remote
+    /// side has [`finish`]ed the stream and the local side has already read all bytes.
     ///
-    /// If no data is available for reading, the method returns Poll::Pending
-    /// and arranges for the current task (via cx.waker()) to receive a notification
-    /// when the stream becomes readable or is closed.
+    /// If no data is available for reading, this returns `Poll::Pending` and arranges for the
+    /// current task (via `cx.waker()`) to be notified when the stream becomes readable or is
+    /// closed.
+    ///
+    /// [`finish`]: crate::SendStream::finish
     pub fn poll_read(
         &mut self,
         cx: &mut Context,
@@ -159,7 +115,19 @@ impl RecvStream {
         Poll::Ready(Ok(buf.filled().len()))
     }
 
-    fn poll_read_buf(
+    /// Attempts to read from the stream into the provided buffer, which may be uninitialized
+    ///
+    /// On success, returns `Poll::Ready(Ok(()))` and places data into the unfilled portion of
+    /// `buf`. If this does not write any bytes to `buf` (and `buf.remaining()` is non-zero), that
+    /// indicates that the remote side has [`finish`]ed the stream and the local side has already
+    /// read all bytes.
+    ///
+    /// If no data is available for reading, this returns `Poll::Pending` and arranges for the
+    /// current task (via `cx.waker()`) to be notified when the stream becomes readable or is
+    /// closed.
+    ///
+    /// [`finish`]: crate::SendStream::finish
+    pub fn poll_read_buf(
         &mut self,
         cx: &mut Context,
         buf: &mut ReadBuf<'_>,
@@ -294,7 +262,7 @@ impl RecvStream {
             stream: self,
             size_limit,
             read: Vec::new(),
-            start: u64::max_value(),
+            start: u64::MAX,
             end: 0,
         }
         .await
@@ -303,8 +271,8 @@ impl RecvStream {
     /// Stop accepting data
     ///
     /// Discards unread data and notifies the peer to stop transmitting. Once stopped, further
-    /// attempts to operate on a stream will yield `UnknownStream` errors.
-    pub fn stop(&mut self, error_code: VarInt) -> Result<(), UnknownStream> {
+    /// attempts to operate on a stream will yield `ClosedStream` errors.
+    pub fn stop(&mut self, error_code: VarInt) -> Result<(), ClosedStream> {
         let mut conn = self.conn.state.lock("RecvStream::stop");
         if self.is_0rtt && conn.check_0rtt().is_err() {
             return Ok(());
@@ -326,6 +294,49 @@ impl RecvStream {
     /// Get the identity of this stream
     pub fn id(&self) -> StreamId {
         self.stream
+    }
+
+    /// Completes when the stream has been reset by the peer or otherwise closed
+    ///
+    /// Yields `Some` with the reset error code when the stream is reset by the peer. Yields `None`
+    /// when the stream was previously [`stop()`](Self::stop)ed, or when the stream was
+    /// [`finish()`](crate::SendStream::finish)ed by the peer and all data has been received, after
+    /// which it is no longer meaningful for the stream to be reset.
+    ///
+    /// This operation is cancel-safe.
+    pub async fn received_reset(&mut self) -> Result<Option<VarInt>, ResetError> {
+        poll_fn(|cx| {
+            let mut conn = self.conn.state.lock("RecvStream::reset");
+            if self.is_0rtt && conn.check_0rtt().is_err() {
+                return Poll::Ready(Err(ResetError::ZeroRttRejected));
+            }
+
+            if let Some(code) = self.reset {
+                return Poll::Ready(Ok(Some(code)));
+            }
+
+            match conn.inner.recv_stream(self.stream).received_reset() {
+                Err(_) => Poll::Ready(Ok(None)),
+                Ok(Some(error_code)) => {
+                    // Stream state has just now been freed, so the connection may need to issue new
+                    // stream ID flow control credit
+                    conn.wake();
+                    Poll::Ready(Ok(Some(error_code)))
+                }
+                Ok(None) => {
+                    if let Some(e) = &conn.error {
+                        return Poll::Ready(Err(e.clone().into()));
+                    }
+                    // Resets always notify readers, since a reset is an immediate read error. We
+                    // could introduce a dedicated channel to reduce the risk of spurious wakeups,
+                    // but that increased complexity is probably not justified, as an application
+                    // that is expecting a reset is not likely to receive large amounts of data.
+                    conn.blocked_readers.insert(self.stream, cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+        })
+        .await
     }
 
     /// Handle common logic related to reading out of a receive stream
@@ -355,7 +366,7 @@ impl RecvStream {
 
         // If we stored an error during a previous call, return it now. This can happen if a
         // `read_fn` both wants to return data and also returns an error in its final stream status.
-        let status = match self.reset.take() {
+        let status = match self.reset {
             Some(code) => ReadStatus::Failed(None, Reset(code)),
             None => {
                 let mut recv = conn.inner.recv_stream(self.stream);
@@ -387,6 +398,7 @@ impl RecvStream {
             ReadStatus::Failed(read, Reset(error_code)) => match read {
                 None => {
                     self.all_data_read = true;
+                    self.reset = Some(error_code);
                     Poll::Ready(Err(ReadError::Reset(error_code)))
                 }
                 done => {
@@ -416,7 +428,6 @@ impl<T> From<(Option<T>, Option<proto::ReadError>)> for ReadStatus<T> {
 /// Future produced by [`RecvStream::read_to_end()`].
 ///
 /// [`RecvStream::read_to_end()`]: crate::RecvStream::read_to_end
-#[must_use = "futures/streams/sinks do nothing unless you `.await` or poll them"]
 struct ReadToEnd<'a> {
     stream: &'a mut RecvStream,
     read: Vec<(Bytes, u64)>,
@@ -476,7 +487,7 @@ impl futures_io::AsyncRead for RecvStream {
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         let mut buf = ReadBuf::new(buf);
-        ready!(RecvStream::poll_read_buf(self.get_mut(), cx, &mut buf))?;
+        ready!(Self::poll_read_buf(self.get_mut(), cx, &mut buf))?;
         Poll::Ready(Ok(buf.filled().len()))
     }
 }
@@ -503,7 +514,7 @@ impl Drop for RecvStream {
             return;
         }
         if !self.all_data_read {
-            // Ignore UnknownStream errors
+            // Ignore ClosedStream errors
             let _ = conn.inner.recv_stream(self.stream).stop(0u32.into());
             conn.wake();
         }
@@ -522,8 +533,8 @@ pub enum ReadError {
     #[error("connection lost")]
     ConnectionLost(#[from] ConnectionError),
     /// The stream has already been stopped, finished, or reset
-    #[error("unknown stream")]
-    UnknownStream,
+    #[error("closed stream")]
+    ClosedStream,
     /// Attempted an ordered read following an unordered read
     ///
     /// Performing an unordered read allows discontinuities to arise in the receive buffer of a
@@ -543,19 +554,55 @@ pub enum ReadError {
 impl From<ReadableError> for ReadError {
     fn from(e: ReadableError) -> Self {
         match e {
-            ReadableError::UnknownStream => Self::UnknownStream,
+            ReadableError::ClosedStream => Self::ClosedStream,
             ReadableError::IllegalOrderedRead => Self::IllegalOrderedRead,
+        }
+    }
+}
+
+impl From<ResetError> for ReadError {
+    fn from(e: ResetError) -> Self {
+        match e {
+            ResetError::ConnectionLost(e) => Self::ConnectionLost(e),
+            ResetError::ZeroRttRejected => Self::ZeroRttRejected,
         }
     }
 }
 
 impl From<ReadError> for io::Error {
     fn from(x: ReadError) -> Self {
-        use self::ReadError::*;
+        use ReadError::*;
         let kind = match x {
             Reset { .. } | ZeroRttRejected => io::ErrorKind::ConnectionReset,
-            ConnectionLost(_) | UnknownStream => io::ErrorKind::NotConnected,
+            ConnectionLost(_) | ClosedStream => io::ErrorKind::NotConnected,
             IllegalOrderedRead => io::ErrorKind::InvalidInput,
+        };
+        Self::new(kind, x)
+    }
+}
+
+/// Errors that arise while waiting for a stream to be reset
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ResetError {
+    /// The connection was lost
+    #[error("connection lost")]
+    ConnectionLost(#[from] ConnectionError),
+    /// This was a 0-RTT stream and the server rejected it
+    ///
+    /// Can only occur on clients for 0-RTT streams, which can be opened using
+    /// [`Connecting::into_0rtt()`].
+    ///
+    /// [`Connecting::into_0rtt()`]: crate::Connecting::into_0rtt()
+    #[error("0-RTT rejected")]
+    ZeroRttRejected,
+}
+
+impl From<ResetError> for io::Error {
+    fn from(x: ResetError) -> Self {
+        use ResetError::*;
+        let kind = match x {
+            ZeroRttRejected => io::ErrorKind::ConnectionReset,
+            ConnectionLost(_) => io::ErrorKind::NotConnected,
         };
         Self::new(kind, x)
     }
@@ -564,13 +611,12 @@ impl From<ReadError> for io::Error {
 /// Future produced by [`RecvStream::read()`].
 ///
 /// [`RecvStream::read()`]: crate::RecvStream::read
-#[must_use = "futures/streams/sinks do nothing unless you `.await` or poll them"]
 struct Read<'a> {
     stream: &'a mut RecvStream,
     buf: ReadBuf<'a>,
 }
 
-impl<'a> Future for Read<'a> {
+impl Future for Read<'_> {
     type Output = Result<Option<usize>, ReadError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
@@ -586,24 +632,21 @@ impl<'a> Future for Read<'a> {
 /// Future produced by [`RecvStream::read_exact()`].
 ///
 /// [`RecvStream::read_exact()`]: crate::RecvStream::read_exact
-#[must_use = "futures/streams/sinks do nothing unless you `.await` or poll them"]
 struct ReadExact<'a> {
     stream: &'a mut RecvStream,
     buf: ReadBuf<'a>,
 }
 
-impl<'a> Future for ReadExact<'a> {
+impl Future for ReadExact<'_> {
     type Output = Result<(), ReadExactError>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let total = this.buf.remaining();
-        let mut remaining = total;
+        let mut remaining = this.buf.remaining();
         while remaining > 0 {
             ready!(this.stream.poll_read_buf(cx, &mut this.buf))?;
             let new = this.buf.remaining();
             if new == remaining {
-                let read = total - remaining;
-                return Poll::Ready(Err(ReadExactError::FinishedEarly(read)));
+                return Poll::Ready(Err(ReadExactError::FinishedEarly(this.buf.filled().len())));
             }
             remaining = new;
         }
@@ -625,14 +668,13 @@ pub enum ReadExactError {
 /// Future produced by [`RecvStream::read_chunk()`].
 ///
 /// [`RecvStream::read_chunk()`]: crate::RecvStream::read_chunk
-#[must_use = "futures/streams/sinks do nothing unless you `.await` or poll them"]
 struct ReadChunk<'a> {
     stream: &'a mut RecvStream,
     max_length: usize,
     ordered: bool,
 }
 
-impl<'a> Future for ReadChunk<'a> {
+impl Future for ReadChunk<'_> {
     type Output = Result<Option<Chunk>, ReadError>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let (max_length, ordered) = (self.max_length, self.ordered);
@@ -643,13 +685,12 @@ impl<'a> Future for ReadChunk<'a> {
 /// Future produced by [`RecvStream::read_chunks()`].
 ///
 /// [`RecvStream::read_chunks()`]: crate::RecvStream::read_chunks
-#[must_use = "futures/streams/sinks do nothing unless you `.await` or poll them"]
 struct ReadChunks<'a> {
     stream: &'a mut RecvStream,
     bufs: &'a mut [Bytes],
 }
 
-impl<'a> Future for ReadChunks<'a> {
+impl Future for ReadChunks<'_> {
     type Output = Result<Option<usize>, ReadError>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.get_mut();

@@ -1,8 +1,8 @@
-use std::{fmt, net::SocketAddr, time::Instant};
+use std::{fmt, net::SocketAddr};
 
 use bytes::{Buf, BufMut, BytesMut};
 
-use crate::{coding::BufExt, packet::PartialDecode, ResetToken, MAX_CID_SIZE};
+use crate::{Instant, MAX_CID_SIZE, ResetToken, coding::BufExt, packet::PartialDecode};
 
 /// Events sent from an Endpoint to a Connection
 #[derive(Debug)]
@@ -11,15 +11,19 @@ pub struct ConnectionEvent(pub(crate) ConnectionEventInner);
 #[derive(Debug)]
 pub(crate) enum ConnectionEventInner {
     /// A datagram has been received for the Connection
-    Datagram {
-        now: Instant,
-        remote: SocketAddr,
-        ecn: Option<EcnCodepoint>,
-        first_decode: PartialDecode,
-        remaining: Option<BytesMut>,
-    },
+    Datagram(DatagramConnectionEvent),
     /// New connection identifiers have been issued for the Connection
     NewIdentifiers(Vec<IssuedCid>, Instant),
+}
+
+/// Variant of [`ConnectionEventInner`].
+#[derive(Debug)]
+pub(crate) struct DatagramConnectionEvent {
+    pub(crate) now: Instant,
+    pub(crate) remote: SocketAddr,
+    pub(crate) ecn: Option<EcnCodepoint>,
+    pub(crate) first_decode: PartialDecode,
+    pub(crate) remaining: Option<BytesMut>,
 }
 
 /// Events sent from a Connection to an Endpoint
@@ -82,7 +86,7 @@ impl ConnectionId {
     /// Constructs cid by reading `len` bytes from a `Buf`
     ///
     /// Callers need to assure that `buf.remaining() >= len`
-    pub(crate) fn from_buf(buf: &mut impl Buf, len: usize) -> Self {
+    pub fn from_buf(buf: &mut (impl Buf + ?Sized), len: usize) -> Self {
         debug_assert!(len <= MAX_CID_SIZE);
         let mut res = Self {
             len: len as u8,
@@ -140,18 +144,18 @@ impl fmt::Display for ConnectionId {
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum EcnCodepoint {
-    #[doc(hidden)]
+    /// The ECT(0) codepoint, indicating that an endpoint is ECN-capable
     Ect0 = 0b10,
-    #[doc(hidden)]
+    /// The ECT(1) codepoint, indicating that an endpoint is ECN-capable
     Ect1 = 0b01,
-    #[doc(hidden)]
+    /// The CE codepoint, signalling that congestion was experienced
     Ce = 0b11,
 }
 
 impl EcnCodepoint {
     /// Create new object from the given bits
     pub fn from_bits(x: u8) -> Option<Self> {
-        use self::EcnCodepoint::*;
+        use EcnCodepoint::*;
         Some(match x & 0b11 {
             0b10 => Ect0,
             0b01 => Ect1,

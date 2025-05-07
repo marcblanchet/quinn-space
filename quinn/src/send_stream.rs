@@ -2,23 +2,20 @@ use std::{
     future::Future,
     io,
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
 };
 
 use bytes::Bytes;
-use proto::{ConnectionError, FinishError, StreamId, Written};
+use proto::{ClosedStream, ConnectionError, FinishError, StreamId, Written};
 use thiserror::Error;
-use tokio::sync::oneshot;
 
-use crate::{
-    connection::{ConnectionRef, UnknownStream},
-    VarInt,
-};
+use crate::{VarInt, connection::ConnectionRef};
 
 /// A stream that can only be used to send data
 ///
-/// If dropped, streams that haven't been explicitly [`reset()`] will continue to (re)transmit
-/// previously written data until it has been fully acknowledged or the connection is closed.
+/// If dropped, streams that haven't been explicitly [`reset()`] will be implicitly [`finish()`]ed,
+/// continuing to (re)transmit previously written data until it has been fully acknowledged or the
+/// connection is closed.
 ///
 /// # Cancellation
 ///
@@ -29,12 +26,12 @@ use crate::{
 /// cancel-safe.
 ///
 /// [`reset()`]: SendStream::reset
+/// [`finish()`]: SendStream::finish
 #[derive(Debug)]
 pub struct SendStream {
     conn: ConnectionRef,
     stream: StreamId,
     is_0rtt: bool,
-    finishing: Option<oneshot::Receiver<Option<WriteError>>>,
 }
 
 impl SendStream {
@@ -43,7 +40,6 @@ impl SendStream {
             conn,
             stream,
             is_0rtt,
-            finishing: None,
         }
     }
 
@@ -121,8 +117,8 @@ impl SendStream {
             Err(Stopped(error_code)) => {
                 return Poll::Ready(Err(WriteError::Stopped(error_code)));
             }
-            Err(UnknownStream) => {
-                return Poll::Ready(Err(WriteError::UnknownStream));
+            Err(ClosedStream) => {
+                return Poll::Ready(Err(WriteError::ClosedStream));
             }
         };
 
@@ -130,56 +126,28 @@ impl SendStream {
         Poll::Ready(Ok(result))
     }
 
-    /// Shut down the send stream gracefully.
+    /// Notify the peer that no more data will ever be written to this stream
     ///
-    /// No new data may be written after calling this method. Completes when the peer has
-    /// acknowledged all sent data, retransmitting data as needed.
-    pub async fn finish(&mut self) -> Result<(), WriteError> {
-        Finish { stream: self }.await
-    }
-
-    /// Attempt to shut down the send stream gracefully.
+    /// It is an error to write to a [`SendStream`] after `finish()`ing it. [`reset()`](Self::reset)
+    /// may still be called after `finish` to abandon transmission of any stream data that might
+    /// still be buffered.
     ///
-    /// No new data may be written after calling this method. Completes when the peer has
-    /// acknowledged all sent data, retransmitting data as needed.
-    pub fn poll_finish(&mut self, cx: &mut Context) -> Poll<Result<(), WriteError>> {
-        let mut conn = self.conn.state.lock("poll_finish");
-        if self.is_0rtt {
-            conn.check_0rtt()
-                .map_err(|()| WriteError::ZeroRttRejected)?;
-        }
-        if self.finishing.is_none() {
-            conn.inner
-                .send_stream(self.stream)
-                .finish()
-                .map_err(|e| match e {
-                    FinishError::UnknownStream => WriteError::UnknownStream,
-                    FinishError::Stopped(error_code) => WriteError::Stopped(error_code),
-                })?;
-            let (send, recv) = oneshot::channel();
-            self.finishing = Some(recv);
-            conn.finishing.insert(self.stream, send);
-            conn.wake();
-        }
-        match Pin::new(self.finishing.as_mut().unwrap())
-            .poll(cx)
-            .map(|x| x.unwrap())
-        {
-            Poll::Ready(x) => {
-                self.finishing = None;
-                Poll::Ready(x.map_or(Ok(()), Err))
+    /// To wait for the peer to receive all buffered stream data, see [`stopped()`](Self::stopped).
+    ///
+    /// May fail if [`finish()`](Self::finish) or [`reset()`](Self::reset) was previously
+    /// called. This error is harmless and serves only to indicate that the caller may have
+    /// incorrect assumptions about the stream's state.
+    pub fn finish(&mut self) -> Result<(), ClosedStream> {
+        let mut conn = self.conn.state.lock("finish");
+        match conn.inner.send_stream(self.stream).finish() {
+            Ok(()) => {
+                conn.wake();
+                Ok(())
             }
-            Poll::Pending => {
-                // To ensure that finished streams can be detected even after the connection is
-                // closed, we must only check for connection errors after determining that the
-                // stream has not yet been finished. Note that this relies on holding the connection
-                // lock so that it is impossible for the stream to become finished between the above
-                // poll call and this check.
-                if let Some(ref x) = conn.error {
-                    return Poll::Ready(Err(WriteError::ConnectionLost(x.clone())));
-                }
-                Poll::Pending
-            }
+            Err(FinishError::ClosedStream) => Err(ClosedStream::default()),
+            // Harmless. If the application needs to know about stopped streams at this point, it
+            // should call `stopped`.
+            Err(FinishError::Stopped(_)) => Ok(()),
         }
     }
 
@@ -188,7 +156,11 @@ impl SendStream {
     /// No new data can be written after calling this method. Locally buffered data is dropped, and
     /// previously transmitted data will no longer be retransmitted if lost. If an attempt has
     /// already been made to finish the stream, the peer may still receive all written data.
-    pub fn reset(&mut self, error_code: VarInt) -> Result<(), UnknownStream> {
+    ///
+    /// May fail if [`finish()`](Self::finish) or [`reset()`](Self::reset) was previously
+    /// called. This error is harmless and serves only to indicate that the caller may have
+    /// incorrect assumptions about the stream's state.
+    pub fn reset(&mut self, error_code: VarInt) -> Result<(), ClosedStream> {
         let mut conn = self.conn.state.lock("SendStream::reset");
         if self.is_0rtt && conn.check_0rtt().is_err() {
             return Ok(());
@@ -205,25 +177,33 @@ impl SendStream {
     /// the priority of a stream with pending data may only take effect after that data has been
     /// transmitted. Using many different priority levels per connection may have a negative
     /// impact on performance.
-    pub fn set_priority(&self, priority: i32) -> Result<(), UnknownStream> {
+    pub fn set_priority(&self, priority: i32) -> Result<(), ClosedStream> {
         let mut conn = self.conn.state.lock("SendStream::set_priority");
         conn.inner.send_stream(self.stream).set_priority(priority)?;
         Ok(())
     }
 
     /// Get the priority of the send stream
-    pub fn priority(&self) -> Result<i32, UnknownStream> {
+    pub fn priority(&self) -> Result<i32, ClosedStream> {
         let mut conn = self.conn.state.lock("SendStream::priority");
-        Ok(conn.inner.send_stream(self.stream).priority()?)
+        conn.inner.send_stream(self.stream).priority()
     }
 
-    /// Completes if/when the peer stops the stream, yielding the error code
-    pub async fn stopped(&mut self) -> Result<VarInt, StoppedError> {
+    /// Completes when the peer stops the stream or reads the stream to completion
+    ///
+    /// Yields `Some` with the stop error code if the peer stops the stream. Yields `None` if the
+    /// local side [`finish()`](Self::finish)es the stream and then the peer acknowledges receipt
+    /// of all stream data (although not necessarily the processing of it), after which the peer
+    /// closing the stream is no longer meaningful.
+    ///
+    /// For a variety of reasons, the peer may not send acknowledgements immediately upon receiving
+    /// data. As such, relying on `stopped` to know when the peer has read a stream to completion
+    /// may introduce more latency than using an application-level response of some sort.
+    pub async fn stopped(&mut self) -> Result<Option<VarInt>, StoppedError> {
         Stopped { stream: self }.await
     }
 
-    #[doc(hidden)]
-    pub fn poll_stopped(&mut self, cx: &mut Context) -> Poll<Result<VarInt, StoppedError>> {
+    fn poll_stopped(&mut self, cx: &mut Context) -> Poll<Result<Option<VarInt>, StoppedError>> {
         let mut conn = self.conn.state.lock("SendStream::poll_stopped");
 
         if self.is_0rtt {
@@ -232,9 +212,12 @@ impl SendStream {
         }
 
         match conn.inner.send_stream(self.stream).stopped() {
-            Err(_) => Poll::Ready(Err(StoppedError::UnknownStream)),
-            Ok(Some(error_code)) => Poll::Ready(Ok(error_code)),
+            Err(_) => Poll::Ready(Ok(None)),
+            Ok(Some(error_code)) => Poll::Ready(Ok(Some(error_code))),
             Ok(None) => {
+                if let Some(e) = &conn.error {
+                    return Poll::Ready(Err(e.clone().into()));
+                }
                 conn.stopped.insert(self.stream, cx.waker().clone());
                 Poll::Pending
             }
@@ -265,19 +248,18 @@ impl SendStream {
 #[cfg(feature = "futures-io")]
 impl futures_io::AsyncWrite for SendStream {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
-        SendStream::execute_poll(self.get_mut(), cx, |stream| stream.write(buf)).map_err(Into::into)
+        Self::execute_poll(self.get_mut(), cx, |stream| stream.write(buf)).map_err(Into::into)
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        self.get_mut().poll_finish(cx).map_err(Into::into)
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
+        Poll::Ready(self.get_mut().finish().map_err(Into::into))
     }
 }
 
-#[cfg(feature = "runtime-tokio")]
 impl tokio::io::AsyncWrite for SendStream {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -291,8 +273,8 @@ impl tokio::io::AsyncWrite for SendStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        self.get_mut().poll_finish(cx).map_err(Into::into)
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<io::Result<()>> {
+        Poll::Ready(self.get_mut().finish().map_err(Into::into))
     }
 }
 
@@ -301,50 +283,32 @@ impl Drop for SendStream {
         let mut conn = self.conn.state.lock("SendStream::drop");
 
         // clean up any previously registered wakers
-        conn.finishing.remove(&self.stream);
         conn.stopped.remove(&self.stream);
         conn.blocked_writers.remove(&self.stream);
 
         if conn.error.is_some() || (self.is_0rtt && conn.check_0rtt().is_err()) {
             return;
         }
-        if self.finishing.is_none() {
-            match conn.inner.send_stream(self.stream).finish() {
-                Ok(()) => conn.wake(),
-                Err(FinishError::Stopped(reason)) => {
-                    if conn.inner.send_stream(self.stream).reset(reason).is_ok() {
-                        conn.wake();
-                    }
+        match conn.inner.send_stream(self.stream).finish() {
+            Ok(()) => conn.wake(),
+            Err(FinishError::Stopped(reason)) => {
+                if conn.inner.send_stream(self.stream).reset(reason).is_ok() {
+                    conn.wake();
                 }
-                // Already finished or reset, which is fine.
-                Err(FinishError::UnknownStream) => {}
             }
+            // Already finished or reset, which is fine.
+            Err(FinishError::ClosedStream) => {}
         }
     }
 }
 
-/// Future produced by `SendStream::finish`
-#[must_use = "futures/streams/sinks do nothing unless you `.await` or poll them"]
-struct Finish<'a> {
-    stream: &'a mut SendStream,
-}
-
-impl Future for Finish<'_> {
-    type Output = Result<(), WriteError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        self.get_mut().stream.poll_finish(cx)
-    }
-}
-
 /// Future produced by `SendStream::stopped`
-#[must_use = "futures/streams/sinks do nothing unless you `.await` or poll them"]
 struct Stopped<'a> {
     stream: &'a mut SendStream,
 }
 
 impl Future for Stopped<'_> {
-    type Output = Result<VarInt, StoppedError>;
+    type Output = Result<Option<VarInt>, StoppedError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         self.get_mut().stream.poll_stopped(cx)
@@ -354,13 +318,12 @@ impl Future for Stopped<'_> {
 /// Future produced by [`SendStream::write()`].
 ///
 /// [`SendStream::write()`]: crate::SendStream::write
-#[must_use = "futures/streams/sinks do nothing unless you `.await` or poll them"]
 struct Write<'a> {
     stream: &'a mut SendStream,
     buf: &'a [u8],
 }
 
-impl<'a> Future for Write<'a> {
+impl Future for Write<'_> {
     type Output = Result<usize, WriteError>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -372,13 +335,12 @@ impl<'a> Future for Write<'a> {
 /// Future produced by [`SendStream::write_all()`].
 ///
 /// [`SendStream::write_all()`]: crate::SendStream::write_all
-#[must_use = "futures/streams/sinks do nothing unless you `.await` or poll them"]
 struct WriteAll<'a> {
     stream: &'a mut SendStream,
     buf: &'a [u8],
 }
 
-impl<'a> Future for WriteAll<'a> {
+impl Future for WriteAll<'_> {
     type Output = Result<(), WriteError>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -396,13 +358,12 @@ impl<'a> Future for WriteAll<'a> {
 /// Future produced by [`SendStream::write_chunks()`].
 ///
 /// [`SendStream::write_chunks()`]: crate::SendStream::write_chunks
-#[must_use = "futures/streams/sinks do nothing unless you `.await` or poll them"]
 struct WriteChunks<'a> {
     stream: &'a mut SendStream,
     bufs: &'a mut [Bytes],
 }
 
-impl<'a> Future for WriteChunks<'a> {
+impl Future for WriteChunks<'_> {
     type Output = Result<Written, WriteError>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -414,13 +375,12 @@ impl<'a> Future for WriteChunks<'a> {
 /// Future produced by [`SendStream::write_chunk()`].
 ///
 /// [`SendStream::write_chunk()`]: crate::SendStream::write_chunk
-#[must_use = "futures/streams/sinks do nothing unless you `.await` or poll them"]
 struct WriteChunk<'a> {
     stream: &'a mut SendStream,
     buf: [Bytes; 1],
 }
 
-impl<'a> Future for WriteChunk<'a> {
+impl Future for WriteChunk<'_> {
     type Output = Result<(), WriteError>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -437,14 +397,13 @@ impl<'a> Future for WriteChunk<'a> {
 /// Future produced by [`SendStream::write_all_chunks()`].
 ///
 /// [`SendStream::write_all_chunks()`]: crate::SendStream::write_all_chunks
-#[must_use = "futures/streams/sinks do nothing unless you `.await` or poll them"]
 struct WriteAllChunks<'a> {
     stream: &'a mut SendStream,
     bufs: &'a mut [Bytes],
     offset: usize,
 }
 
-impl<'a> Future for WriteAllChunks<'a> {
+impl Future for WriteAllChunks<'_> {
     type Output = Result<(), WriteError>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -471,8 +430,8 @@ pub enum WriteError {
     #[error("connection lost")]
     ConnectionLost(#[from] ConnectionError),
     /// The stream has already been finished or reset
-    #[error("unknown stream")]
-    UnknownStream,
+    #[error("closed stream")]
+    ClosedStream,
     /// This was a 0-RTT stream and the server rejected it
     ///
     /// Can only occur on clients for 0-RTT streams, which can be opened using
@@ -481,6 +440,33 @@ pub enum WriteError {
     /// [`Connecting::into_0rtt()`]: crate::Connecting::into_0rtt()
     #[error("0-RTT rejected")]
     ZeroRttRejected,
+}
+
+impl From<ClosedStream> for WriteError {
+    #[inline]
+    fn from(_: ClosedStream) -> Self {
+        Self::ClosedStream
+    }
+}
+
+impl From<StoppedError> for WriteError {
+    fn from(x: StoppedError) -> Self {
+        match x {
+            StoppedError::ConnectionLost(e) => Self::ConnectionLost(e),
+            StoppedError::ZeroRttRejected => Self::ZeroRttRejected,
+        }
+    }
+}
+
+impl From<WriteError> for io::Error {
+    fn from(x: WriteError) -> Self {
+        use WriteError::*;
+        let kind = match x {
+            Stopped(_) | ZeroRttRejected => io::ErrorKind::ConnectionReset,
+            ConnectionLost(_) | ClosedStream => io::ErrorKind::NotConnected,
+        };
+        Self::new(kind, x)
+    }
 }
 
 /// Errors that arise while monitoring for a send stream stop from the peer
@@ -489,9 +475,6 @@ pub enum StoppedError {
     /// The connection was lost
     #[error("connection lost")]
     ConnectionLost(#[from] ConnectionError),
-    /// The stream has already been finished or reset
-    #[error("unknown stream")]
-    UnknownStream,
     /// This was a 0-RTT stream and the server rejected it
     ///
     /// Can only occur on clients for 0-RTT streams, which can be opened using
@@ -502,12 +485,12 @@ pub enum StoppedError {
     ZeroRttRejected,
 }
 
-impl From<WriteError> for io::Error {
-    fn from(x: WriteError) -> Self {
-        use self::WriteError::*;
+impl From<StoppedError> for io::Error {
+    fn from(x: StoppedError) -> Self {
+        use StoppedError::*;
         let kind = match x {
-            Stopped(_) | ZeroRttRejected => io::ErrorKind::ConnectionReset,
-            ConnectionLost(_) | UnknownStream => io::ErrorKind::NotConnected,
+            ZeroRttRejected => io::ErrorKind::ConnectionReset,
+            ConnectionLost(_) => io::ErrorKind::NotConnected,
         };
         Self::new(kind, x)
     }

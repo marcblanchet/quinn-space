@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{binary_heap::PeekMut, BinaryHeap},
+    collections::{BinaryHeap, binary_heap::PeekMut},
     mem,
 };
 
@@ -27,6 +27,14 @@ pub(super) struct Assembler {
 impl Assembler {
     pub(super) fn new() -> Self {
         Self::default()
+    }
+
+    /// Reset to the initial state
+    pub(super) fn reinit(&mut self) {
+        let old_data = mem::take(&mut self.data);
+        *self = Self::default();
+        self.data = old_data;
+        self.data.clear();
     }
 
     pub(super) fn ensure_ordering(&mut self, ordered: bool) -> Result<(), IllegalOrderedRead> {
@@ -198,10 +206,6 @@ impl Assembler {
         if over_allocation > threshold {
             self.defragment()
         }
-    }
-
-    pub(super) fn set_bytes_read(&mut self, new: u64) {
-        self.bytes_read = new;
     }
 
     /// Number of bytes consumed by the application

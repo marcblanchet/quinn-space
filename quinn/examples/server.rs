@@ -13,8 +13,11 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
-use tracing::{error, info_span};
+use proto::crypto::rustls::QuicServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tracing::{error, info, info_span};
 use tracing_futures::Instrument as _;
 use proto::congestion::{BbrConfig, NoCCConfig};
 use proto::{AckFrequencyConfig, MtuDiscoveryConfig, VarInt};
@@ -41,6 +44,12 @@ struct Opt {
     /// Address to listen on
     #[clap(long = "listen", default_value = "[::1]:4433")]
     listen: SocketAddr,
+    /// Client address to block
+    #[clap(long = "block")]
+    block: Option<SocketAddr>,
+    /// Maximum number of concurrent connections to allow
+    #[clap(long = "connection-limit")]
+    connection_limit: Option<usize>,
 
     // sets the congestion control methods. Since cubic is default, options are:
     // "bbr" or "none".
@@ -88,30 +97,19 @@ fn main() {
 async fn run(options: Opt) -> Result<()> {
     let (certs, key) = if let (Some(key_path), Some(cert_path)) = (&options.key, &options.cert) {
         let key = fs::read(key_path).context("failed to read private key")?;
-        let key = if key_path.extension().map_or(false, |x| x == "der") {
-            rustls::PrivateKey(key)
+        let key = if key_path.extension().is_some_and(|x| x == "der") {
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key))
         } else {
-            let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)
-                .context("malformed PKCS #8 private key")?;
-            match pkcs8.into_iter().next() {
-                Some(x) => rustls::PrivateKey(x),
-                None => {
-                    let rsa = rustls_pemfile::rsa_private_keys(&mut &*key)
-                        .context("malformed PKCS #1 private key")?;
-                    match rsa.into_iter().next() {
-                        Some(x) => rustls::PrivateKey(x),
-                        None => {
-                            anyhow::bail!("no private keys found");
-                        }
-                    }
-                }
-            }
+            rustls_pemfile::private_key(&mut &*key)
+                .context("malformed PKCS #1 private key")?
+                .ok_or_else(|| anyhow::Error::msg("no private keys found"))?
         };
         let cert_chain = fs::read(cert_path).context("failed to read certificate chain")?;
-        let cert_chain = if cert_path.extension().map_or(false, |x| x == "der") {
-            vec![rustls::Certificate(cert_chain)]
+        let cert_chain = if cert_path.extension().is_some_and(|x| x == "der") {
+            vec![CertificateDer::from(cert_chain)]
         } else {
             rustls_pemfile::certs(&mut &*cert_chain)
+                .collect::<Result<_, _>>()
                 .context("invalid PEM-encoded certificate")?
                 .into_iter()
                 .map(rustls::Certificate)
@@ -125,16 +123,20 @@ async fn run(options: Opt) -> Result<()> {
         let cert_path = path.join("cert.der");
         let key_path = path.join("key.der");
         let (cert, key) = match fs::read(&cert_path).and_then(|x| Ok((x, fs::read(&key_path)?))) {
-            Ok(x) => x,
+            Ok((cert, key)) => (
+                CertificateDer::from(cert),
+                PrivateKeyDer::try_from(key).map_err(anyhow::Error::msg)?,
+            ),
             Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
-                eprintln!("generating self-signed certificate");
+                info!("generating self-signed certificate");
                 let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-                let key = cert.serialize_private_key_der();
-                let cert = cert.serialize_der().unwrap();
+                let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+                let cert = cert.cert.into();
                 fs::create_dir_all(path).context("failed to create certificate directory")?;
                 fs::write(&cert_path, &cert).context("failed to write certificate")?;
-                fs::write(&key_path, &key).context("failed to write private key")?;
-                (cert, key)
+                fs::write(&key_path, key.secret_pkcs8_der())
+                    .context("failed to write private key")?;
+                (cert, key.into())
             }
             Err(e) => {
                 bail!("failed to read certificate: {}", e);
@@ -155,8 +157,8 @@ async fn run(options: Opt) -> Result<()> {
         server_crypto.key_log = Arc::new(rustls::KeyLogFile::new());
     }
 
-    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
-
+    let mut server_config =
+        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
     let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
     transport_config.max_concurrent_uni_streams(0_u8.into());
     if options.dtn {
@@ -217,20 +219,33 @@ async fn run(options: Opt) -> Result<()> {
     eprintln!("listening on {}", endpoint.local_addr()?);
 
     while let Some(conn) = endpoint.accept().await {
-        eprintln!("connection incoming");
-        eprintln!(" clock: {:?}", Utc::now());
-        let fut = handle_connection(root.clone(), conn);
-        tokio::spawn(async move {
-            if let Err(e) = fut.await {
-                error!("connection failed: {reason}", reason = e.to_string())
-            }
-        });
+        if options
+            .connection_limit
+            .is_some_and(|n| endpoint.open_connections() >= n)
+        {
+            info!("refusing due to open connection limit");
+            conn.refuse();
+        } else if Some(conn.remote_address()) == options.block {
+            info!("refusing blocked client IP address");
+            conn.refuse();
+        } else if options.stateless_retry && !conn.remote_address_validated() {
+            info!("requiring connection to validate its address");
+            conn.retry().unwrap();
+        } else {
+            info!("accepting connection");
+            let fut = handle_connection(root.clone(), conn);
+            tokio::spawn(async move {
+                if let Err(e) = fut.await {
+                    error!("connection failed: {reason}", reason = e.to_string())
+                }
+            });
+        }
     }
 
     Ok(())
 }
 
-async fn handle_connection(root: Arc<Path>, conn: quinn::Connecting) -> Result<()> {
+async fn handle_connection(root: Arc<Path>, conn: quinn::Incoming) -> Result<()> {
     let connection = conn.await?;
     let span = info_span!(
         "connection",
@@ -243,16 +258,14 @@ async fn handle_connection(root: Arc<Path>, conn: quinn::Connecting) -> Result<(
             .map_or_else(|| "<none>".into(), |x| String::from_utf8_lossy(&x).into_owned())
     );
     async {
-        eprintln!("established");
-        eprintln!(" clock: {:?}", Utc::now());
+        info!("established");
 
         // Each stream initiated by the client constitutes a new request.
         loop {
             let stream = connection.accept_bi().await;
             let stream = match stream {
                 Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
-                    eprintln!("connection closed");
-                    eprintln!(" clock: {:?}", Utc::now());
+                    info!("connection closed");
                     return Ok(());
                 }
                 Err(e) => {
@@ -289,8 +302,7 @@ async fn handle_request(
         let part = ascii::escape_default(x).collect::<Vec<_>>();
         escaped.push_str(str::from_utf8(&part).unwrap());
     }
-    eprintln!("content = {escaped}");
-    eprintln!(" clock: {:?}", Utc::now());
+    info!(content = %escaped);
     // Execute the request
     let resp = process_get(&root, &req).unwrap_or_else(|e| {
         error!("failed: {}", e);
@@ -301,11 +313,8 @@ async fn handle_request(
         .await
         .map_err(|e| anyhow!("failed to send response: {}", e))?;
     // Gracefully terminate the stream
-    send.finish()
-        .await
-        .map_err(|e| anyhow!("failed to shutdown stream: {}", e))?;
-    eprintln!("complete");
-    eprintln!(" clock: {:?}", Utc::now());
+    send.finish().unwrap();
+    info!("complete");
     Ok(())
 }
 

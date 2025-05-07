@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use thiserror::Error;
 
-use crate::{connection::send_buffer::SendBuffer, frame, VarInt};
+use crate::{VarInt, connection::send_buffer::SendBuffer, frame};
 
 #[derive(Debug)]
 pub(super) struct Send {
@@ -32,7 +32,7 @@ impl Send {
 
     /// Whether the stream has been reset
     pub(super) fn is_reset(&self) -> bool {
-        matches!(self.state, SendState::ResetSent { .. })
+        matches!(self.state, SendState::ResetSent)
     }
 
     pub(super) fn finish(&mut self) -> Result<(), FinishError> {
@@ -45,7 +45,7 @@ impl Send {
             self.fin_pending = true;
             Ok(())
         } else {
-            Err(FinishError::UnknownStream)
+            Err(FinishError::ClosedStream)
         }
     }
 
@@ -55,7 +55,7 @@ impl Send {
         limit: u64,
     ) -> Result<Written, WriteError> {
         if !self.is_writable() {
-            return Err(WriteError::UnknownStream);
+            return Err(WriteError::ClosedStream);
         }
         if let Some(error_code) = self.stop_reason {
             return Err(WriteError::Stopped(error_code));
@@ -163,7 +163,7 @@ impl<'a> BytesArray<'a> {
     }
 }
 
-impl<'a> BytesSource for BytesArray<'a> {
+impl BytesSource for BytesArray<'_> {
     fn pop_chunk(&mut self, limit: usize) -> (Bytes, usize) {
         // The loop exists to skip empty chunks while still marking them as
         // consumed
@@ -208,7 +208,7 @@ impl<'a> ByteSlice<'a> {
     }
 }
 
-impl<'a> BytesSource for ByteSlice<'a> {
+impl BytesSource for ByteSlice<'_> {
     fn pop_chunk(&mut self, limit: usize) -> (Bytes, usize) {
         let limit = limit.min(self.data.len());
         if limit == 0 {
@@ -274,8 +274,8 @@ pub enum WriteError {
     #[error("stopped by peer: code {0}")]
     Stopped(VarInt),
     /// The stream has not been opened or has already been finished or reset
-    #[error("unknown stream")]
-    UnknownStream,
+    #[error("closed stream")]
+    ClosedStream,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -300,8 +300,8 @@ pub enum FinishError {
     #[error("stopped by peer: code {0}")]
     Stopped(VarInt),
     /// The stream has not been opened or was already finished or reset
-    #[error("unknown stream")]
-    UnknownStream,
+    #[error("closed stream")]
+    ClosedStream,
 }
 
 #[cfg(test)]

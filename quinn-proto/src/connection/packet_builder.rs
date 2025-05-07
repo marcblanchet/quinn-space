@@ -1,14 +1,13 @@
-use std::time::Instant;
-
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use rand::Rng;
 use tracing::{trace, trace_span};
 
-use super::{spaces::SentPacket, Connection, SentFrames};
+use super::{Connection, SentFrames, spaces::SentPacket};
 use crate::{
+    ConnectionId, Instant, TransportError, TransportErrorCode,
+    connection::ConnectionSide,
     frame::{self, Close},
-    packet::{Header, LongType, PacketNumber, PartialEncode, SpaceId, FIXED_BIT},
-    TransportError, TransportErrorCode,
+    packet::{FIXED_BIT, Header, InitialHeader, LongType, PacketNumber, PartialEncode, SpaceId},
 };
 
 pub(super) struct PacketBuilder {
@@ -25,7 +24,7 @@ pub(super) struct PacketBuilder {
     /// frames
     pub(super) max_size: usize,
     pub(super) tag_len: usize,
-    pub(super) span: tracing::Span,
+    pub(super) _span: tracing::span::EnteredSpan,
 }
 
 impl PacketBuilder {
@@ -36,18 +35,19 @@ impl PacketBuilder {
     pub(super) fn new(
         now: Instant,
         space_id: SpaceId,
-        buffer: &mut BytesMut,
+        dst_cid: ConnectionId,
+        buffer: &mut Vec<u8>,
         buffer_capacity: usize,
         datagram_start: usize,
         ack_eliciting: bool,
         conn: &mut Connection,
-        version: u32,
     ) -> Option<Self> {
+        let version = conn.version;
         // Initiate key update if we're approaching the confidentiality limit
         let sent_with_keys = conn.spaces[space_id].sent_with_keys;
         if space_id == SpaceId::Data {
             if sent_with_keys >= conn.key_phase_size {
-                conn.initiate_key_update();
+                conn.force_key_update();
             }
         } else {
             let confidentiality_limit = conn.spaces[space_id]
@@ -78,52 +78,52 @@ impl PacketBuilder {
         }
 
         let space = &mut conn.spaces[space_id];
-
-        space.loss_probes = space.loss_probes.saturating_sub(1);
         let exact_number = match space_id {
             SpaceId::Data => conn.packet_number_filter.allocate(&mut conn.rng, space),
             _ => space.get_tx_number(),
         };
 
-        let span = trace_span!("send", space = ?space_id, pn = exact_number);
-        span.with_subscriber(|(id, dispatch)| dispatch.enter(id));
+        let span = trace_span!("send", space = ?space_id, pn = exact_number).entered();
 
         let number = PacketNumber::new(exact_number, space.largest_acked_packet.unwrap_or(0));
         let header = match space_id {
             SpaceId::Data if space.crypto.is_some() => Header::Short {
-                dst_cid: conn.rem_cids.active(),
+                dst_cid,
                 number,
                 spin: if conn.spin_enabled {
                     conn.spin
                 } else {
-                    conn.rng.gen()
+                    conn.rng.random()
                 },
                 key_phase: conn.key_phase,
             },
             SpaceId::Data => Header::Long {
                 ty: LongType::ZeroRtt,
                 src_cid: conn.handshake_cid,
-                dst_cid: conn.rem_cids.active(),
+                dst_cid,
                 number,
                 version,
             },
             SpaceId::Handshake => Header::Long {
                 ty: LongType::Handshake,
                 src_cid: conn.handshake_cid,
-                dst_cid: conn.rem_cids.active(),
+                dst_cid,
                 number,
                 version,
             },
-            SpaceId::Initial => Header::Initial {
+            SpaceId::Initial => Header::Initial(InitialHeader {
                 src_cid: conn.handshake_cid,
-                dst_cid: conn.rem_cids.active(),
-                token: conn.retry_token.clone(),
+                dst_cid,
+                token: match &conn.side {
+                    ConnectionSide::Client { token, .. } => token.clone(),
+                    ConnectionSide::Server { .. } => Bytes::new(),
+                },
                 number,
                 version,
-            },
+            }),
         };
         let partial_encode = header.encode(buffer);
-        if conn.peer_params.grease_quic_bit && conn.rng.gen() {
+        if conn.peer_params.grease_quic_bit && conn.rng.random() {
             buffer[partial_encode.start] ^= FIXED_BIT;
         }
 
@@ -136,7 +136,7 @@ impl PacketBuilder {
             let zero_rtt = conn.zero_rtt_crypto.as_ref().unwrap();
             (zero_rtt.header.sample_size(), zero_rtt.packet.tag_len())
         } else {
-            unreachable!("tried to send {:?} packet without keys", space_id);
+            unreachable!();
         };
 
         // Each packet must be large enough for header protection sampling, i.e. the combined
@@ -149,9 +149,10 @@ impl PacketBuilder {
         // payload_len >= sample_size + 4 - pn_len - tag_len
         let min_size = Ord::max(
             buffer.len() + (sample_size + 4).saturating_sub(number.len() + tag_len),
-            partial_encode.start + conn.rem_cids.active().len() + 6,
+            partial_encode.start + dst_cid.len() + 6,
         );
         let max_size = buffer_capacity - tag_len;
+        debug_assert!(max_size >= min_size);
 
         Some(Self {
             datagram_start,
@@ -161,16 +162,22 @@ impl PacketBuilder {
             short_header: header.is_short(),
             min_size,
             max_size,
-            span,
             tag_len,
             ack_eliciting,
+            _span: span,
         })
     }
 
+    /// Append the minimum amount of padding to the packet such that, after encryption, the
+    /// enclosing datagram will occupy at least `min_size` bytes
     pub(super) fn pad_to(&mut self, min_size: u16) {
-        let prev = self.min_size;
-        self.min_size = self.datagram_start + (min_size as usize) - self.tag_len;
-        debug_assert!(self.min_size >= prev, "padding must not shrink datagram");
+        // The datagram might already have a larger minimum size than the caller is requesting, if
+        // e.g. we're coalescing packets and have populated more than `min_size` bytes with packets
+        // already.
+        self.min_size = Ord::max(
+            self.min_size,
+            self.datagram_start + (min_size as usize) - self.tag_len,
+        );
     }
 
     pub(super) fn finish_and_track(
@@ -178,7 +185,7 @@ impl PacketBuilder {
         now: Instant,
         conn: &mut Connection,
         sent: Option<SentFrames>,
-        buffer: &mut BytesMut,
+        buffer: &mut Vec<u8>,
     ) {
         let ack_eliciting = self.ack_eliciting;
         let exact_number = self.exact_number;
@@ -221,7 +228,7 @@ impl PacketBuilder {
     }
 
     /// Encrypt packet, returning the length of the packet and whether padding was added
-    pub(super) fn finish(self, conn: &mut Connection, buffer: &mut BytesMut) -> (usize, bool) {
+    pub(super) fn finish(self, conn: &mut Connection, buffer: &mut Vec<u8>) -> (usize, bool) {
         let pad = buffer.len() < self.min_size;
         if pad {
             trace!("PADDING * {}", self.min_size - buffer.len());
@@ -252,8 +259,6 @@ impl PacketBuilder {
             header_crypto,
             Some((self.exact_number, packet_crypto)),
         );
-        self.span
-            .with_subscriber(|(id, dispatch)| dispatch.exit(id));
 
         (buffer.len() - encode_start, pad)
     }

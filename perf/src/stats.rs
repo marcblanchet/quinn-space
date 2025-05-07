@@ -90,18 +90,22 @@ impl Stats {
 
         println!("Stream metrics:\n");
 
-        println!("      │ Upload Duration │ Download Duration | FBL        | Upload Throughput | Download Throughput");
-        println!("──────┼─────────────────┼───────────────────┼────────────┼───────────────────┼────────────────────");
+        println!(
+            "      │ Upload Duration │ Download Duration | FBL        | Upload Throughput | Download Throughput"
+        );
+        println!(
+            "──────┼─────────────────┼───────────────────┼────────────┼───────────────────┼────────────────────"
+        );
 
         let print_metric = |label: &'static str, get_metric: fn(&Histogram<u64>) -> u64| {
             println!(
-                " {} │ {:>15.2?} │ {:>17.2?} │  {:>9.2?} │ {:11.2} MiB/s │ {:13.2} MiB/s",
+                " {} │ {:>15.2?} │ {:>17.2?} │  {:>9.2?} │ {:12.2} Mb/s │ {:13.2} Mb/s",
                 label,
                 Duration::from_micros(get_metric(&self.upload_duration)),
                 Duration::from_micros(get_metric(&self.download_duration)),
                 Duration::from_micros(get_metric(&self.fbl)),
-                get_metric(&self.upload_throughput) as f64 / 1024.0 / 1024.0,
-                get_metric(&self.download_throughput) as f64 / 1024.0 / 1024.0,
+                get_metric(&self.upload_throughput) as f64 * 8.0 / 1000.0 / 1000.0,
+                get_metric(&self.download_throughput) as f64 * 8.0 / 1000.0 / 1000.0,
             );
         };
 
@@ -243,7 +247,8 @@ fn throughput_bytes_per_second(duration_in_micros: u64, size: u64) -> f64 {
 mod json {
     use crate::stats;
     use crate::stats::{Stats, StreamIntervalStats};
-    use serde::{self, ser::SerializeStruct, Serialize, Serializer};
+    use quinn::StreamId;
+    use serde::{self, Serialize, Serializer, ser::SerializeStruct};
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -339,7 +344,8 @@ mod json {
 
     #[derive(Serialize)]
     struct Stream {
-        id: u64,
+        #[serde(serialize_with = "serialize_stream_id")]
+        id: StreamId,
         start: f64,
         end: f64,
         seconds: f64,
@@ -356,7 +362,7 @@ mod json {
             let bits_per_second = stats.bytes as f64 * 8.0 / period.seconds;
 
             Self {
-                id: stats.id.0,
+                id: stats.id,
                 start: period.start,
                 end: period.end,
                 seconds: period.seconds,
@@ -365,6 +371,10 @@ mod json {
                 sender: stats.sender,
             }
         }
+    }
+
+    fn serialize_stream_id<S: Serializer>(id: &StreamId, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(u64::from(*id))
     }
 
     #[derive(Serialize)]

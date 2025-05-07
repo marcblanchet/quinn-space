@@ -1,13 +1,15 @@
-#![cfg(feature = "rustls")]
+#![cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
 use std::{
     convert::TryInto,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use crc::Crc;
-use quinn::{ConnectionError, ReadError, TransportConfig, WriteError};
+use quinn::{ConnectionError, ReadError, StoppedError, TransportConfig, WriteError};
 use rand::{self, RngCore};
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use tokio::runtime::Builder;
 
 struct Shared {
@@ -29,7 +31,8 @@ fn connect_n_nodes_to_1_and_send_1mb_data() {
     let shared = Arc::new(Mutex::new(Shared { errors: vec![] }));
 
     let (cfg, listener_cert) = configure_listener();
-    let endpoint = quinn::Endpoint::server(cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let endpoint =
+        quinn::Endpoint::server(cfg, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
     let listener_addr = endpoint.local_addr().unwrap();
 
     let expected_messages = 50;
@@ -58,7 +61,7 @@ fn connect_n_nodes_to_1_and_send_1mb_data() {
     };
     runtime.spawn(read_incoming_data);
 
-    let client_cfg = configure_connector(&listener_cert);
+    let client_cfg = configure_connector(listener_cert);
 
     for _ in 0..expected_messages {
         let data = random_data_with_hash(1024 * 1024, &crc);
@@ -99,13 +102,12 @@ async fn read_from_peer(mut stream: quinn::RecvStream) -> Result<(), quinn::Conn
             Ok(())
         }
         Err(e) => {
-            use quinn::ReadToEndError::*;
             use ReadError::*;
+            use quinn::ReadToEndError::*;
             match e {
-                TooLong
-                | Read(UnknownStream)
-                | Read(ZeroRttRejected)
-                | Read(IllegalOrderedRead) => unreachable!(),
+                TooLong | Read(ClosedStream) | Read(ZeroRttRejected) | Read(IllegalOrderedRead) => {
+                    unreachable!()
+                }
                 Read(Reset(error_code)) => panic!("unexpected stream reset: {error_code}"),
                 Read(ConnectionLost(e)) => Err(e),
             }
@@ -116,32 +118,33 @@ async fn read_from_peer(mut stream: quinn::RecvStream) -> Result<(), quinn::Conn
 async fn write_to_peer(conn: quinn::Connection, data: Vec<u8>) -> Result<(), WriteError> {
     let mut s = conn.open_uni().await.map_err(WriteError::ConnectionLost)?;
     s.write_all(&data).await?;
-    // Suppress finish errors, since the peer may close before ACKing
-    match s.finish().await {
-        Ok(()) => Ok(()),
-        Err(WriteError::ConnectionLost(ConnectionError::ApplicationClosed { .. })) => Ok(()),
-        Err(e) => Err(e),
+    s.finish().unwrap();
+    // Wait for the stream to be fully received
+    match s.stopped().await {
+        Ok(_) => Ok(()),
+        Err(StoppedError::ConnectionLost(ConnectionError::ApplicationClosed { .. })) => Ok(()),
+        Err(e) => Err(e.into()),
     }
 }
 
 /// Builds client configuration. Trusts given node certificate.
-fn configure_connector(node_cert: &rustls::Certificate) -> quinn::ClientConfig {
+fn configure_connector(node_cert: CertificateDer<'static>) -> quinn::ClientConfig {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(node_cert).unwrap();
 
     let mut transport_config = TransportConfig::default();
     transport_config.max_idle_timeout(Some(Duration::from_secs(20).try_into().unwrap()));
 
-    let mut peer_cfg = quinn::ClientConfig::with_root_certificates(roots);
+    let mut peer_cfg = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
     peer_cfg.transport_config(Arc::new(transport_config));
     peer_cfg
 }
 
 /// Builds listener configuration along with its certificate.
-fn configure_listener() -> (quinn::ServerConfig, rustls::Certificate) {
+fn configure_listener() -> (quinn::ServerConfig, CertificateDer<'static>) {
     let (our_cert, our_priv_key) = gen_cert();
     let mut our_cfg =
-        quinn::ServerConfig::with_single_cert(vec![our_cert.clone()], our_priv_key).unwrap();
+        quinn::ServerConfig::with_single_cert(vec![our_cert.clone()], our_priv_key.into()).unwrap();
 
     let transport_config = Arc::get_mut(&mut our_cfg.transport).unwrap();
     transport_config.max_idle_timeout(Some(Duration::from_secs(20).try_into().unwrap()));
@@ -149,10 +152,12 @@ fn configure_listener() -> (quinn::ServerConfig, rustls::Certificate) {
     (our_cfg, our_cert)
 }
 
-fn gen_cert() -> (rustls::Certificate, rustls::PrivateKey) {
+fn gen_cert() -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    let key = rustls::PrivateKey(cert.serialize_private_key_der());
-    (rustls::Certificate(cert.serialize_der().unwrap()), key)
+    (
+        cert.cert.into(),
+        PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()),
+    )
 }
 
 /// Constructs a buffer with random bytes of given size prefixed with a hash of this data.
@@ -177,9 +182,8 @@ fn hash_correct(data: &[u8], crc: &Crc<u32>) -> bool {
     encoded_hash == actual_hash
 }
 
-#[allow(unsafe_code)]
 fn random_vec(size: usize) -> Vec<u8> {
     let mut ret = vec![0; size];
-    rand::thread_rng().fill_bytes(&mut ret[..]);
+    rand::rng().fill_bytes(&mut ret[..]);
     ret
 }

@@ -3,16 +3,16 @@ use std::{
     io,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
     time::Instant,
 };
 
 use tokio::{
     io::Interest,
-    time::{sleep_until, Sleep},
+    time::{Sleep, sleep_until},
 };
 
-use super::{AsyncTimer, AsyncUdpSocket, Runtime};
+use super::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPollHelper};
 
 /// A Quinn runtime for Tokio
 #[derive(Debug)]
@@ -33,6 +33,10 @@ impl Runtime for TokioRuntime {
             io: tokio::net::UdpSocket::from_std(sock)?,
         }))
     }
+
+    fn now(&self) -> Instant {
+        tokio::time::Instant::now().into_std()
+    }
 }
 
 impl AsyncTimer for Sleep {
@@ -51,15 +55,17 @@ struct UdpSocket {
 }
 
 impl AsyncUdpSocket for UdpSocket {
-    fn poll_send(&self, cx: &mut Context, transmits: &[udp::Transmit]) -> Poll<io::Result<usize>> {
-        let inner = &self.inner;
-        let io = &self.io;
-        loop {
-            ready!(io.poll_send_ready(cx))?;
-            if let Ok(res) = io.try_io(Interest::WRITABLE, || inner.send(io.into(), transmits)) {
-                return Poll::Ready(Ok(res));
-            }
-        }
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn super::UdpPoller>> {
+        Box::pin(UdpPollHelper::new(move || {
+            let socket = self.clone();
+            async move { socket.io.writable().await }
+        }))
+    }
+
+    fn try_send(&self, transmit: &udp::Transmit) -> io::Result<()> {
+        self.io.try_io(Interest::WRITABLE, || {
+            self.inner.send((&self.io).into(), transmit)
+        })
     }
 
     fn poll_recv(

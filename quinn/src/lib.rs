@@ -41,48 +41,49 @@
 #![warn(unreachable_pub)]
 #![warn(clippy::use_self)]
 
-use std::time::Duration;
-
-macro_rules! ready {
-    ($e:expr $(,)?) => {
-        match $e {
-            std::task::Poll::Ready(t) => t,
-            std::task::Poll::Pending => return std::task::Poll::Pending,
-        }
-    };
-}
+use std::sync::Arc;
 
 mod connection;
 mod endpoint;
+mod incoming;
 mod mutex;
 mod recv_stream;
 mod runtime;
 mod send_stream;
 mod work_limiter;
 
-use bytes::Bytes;
+#[cfg(not(wasm_browser))]
+pub(crate) use std::time::{Duration, Instant};
+#[cfg(wasm_browser)]
+pub(crate) use web_time::{Duration, Instant};
+
 pub use proto::{
-    congestion, crypto, AckFrequencyConfig, ApplicationClose, Chunk, ClientConfig, ConfigError,
-    ConnectError, ConnectionClose, ConnectionError, EndpointConfig, IdleTimeout,
-    MtuDiscoveryConfig, ServerConfig, StreamId, Transmit, TransportConfig, VarInt,
+    AckFrequencyConfig, ApplicationClose, Chunk, ClientConfig, ClosedStream, ConfigError,
+    ConnectError, ConnectionClose, ConnectionError, ConnectionId, ConnectionIdGenerator,
+    ConnectionStats, Dir, EcnCodepoint, EndpointConfig, FrameStats, FrameType, IdleTimeout,
+    MtuDiscoveryConfig, NoneTokenLog, NoneTokenStore, PathStats, ServerConfig, Side, StdSystemTime,
+    StreamId, TimeSource, TokenLog, TokenReuseError, TokenStore, Transmit, TransportConfig,
+    TransportErrorCode, UdpStats, ValidationTokenConfig, VarInt, VarIntBoundsExceeded, Written,
+    congestion, crypto,
 };
-#[cfg(feature = "tls-rustls")]
+#[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
 pub use rustls;
 pub use udp;
 
 pub use crate::connection::{
-    AcceptBi, AcceptUni, Connecting, Connection, OpenBi, OpenUni, ReadDatagram, SendDatagramError,
-    UnknownStream, ZeroRttAccepted,
+    AcceptBi, AcceptUni, Connecting, Connection, OpenBi, OpenUni, ReadDatagram, SendDatagram,
+    SendDatagramError, ZeroRttAccepted,
 };
-pub use crate::endpoint::{Accept, Endpoint};
-pub use crate::recv_stream::{ReadError, ReadExactError, ReadToEndError, RecvStream};
+pub use crate::endpoint::{Accept, Endpoint, EndpointStats};
+pub use crate::incoming::{Incoming, IncomingFuture, RetryError};
+pub use crate::recv_stream::{ReadError, ReadExactError, ReadToEndError, RecvStream, ResetError};
 #[cfg(feature = "runtime-async-std")]
 pub use crate::runtime::AsyncStdRuntime;
 #[cfg(feature = "runtime-smol")]
 pub use crate::runtime::SmolRuntime;
 #[cfg(feature = "runtime-tokio")]
 pub use crate::runtime::TokioRuntime;
-pub use crate::runtime::{default_runtime, AsyncTimer, AsyncUdpSocket, Runtime};
+pub use crate::runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPoller, default_runtime};
 pub use crate::send_stream::{SendStream, StoppedError, WriteError};
 
 #[cfg(test)]
@@ -95,13 +96,25 @@ enum ConnectionEvent {
         reason: bytes::Bytes,
     },
     Proto(proto::ConnectionEvent),
-    Ping,
+    Rebind(Arc<dyn AsyncUdpSocket>),
 }
 
-#[derive(Debug)]
-enum EndpointEvent {
-    Proto(proto::EndpointEvent),
-    Transmit(proto::Transmit, Bytes),
+fn udp_transmit<'a>(t: &proto::Transmit, buffer: &'a [u8]) -> udp::Transmit<'a> {
+    udp::Transmit {
+        destination: t.destination,
+        ecn: t.ecn.map(udp_ecn),
+        contents: buffer,
+        segment_size: t.segment_size,
+        src_ip: t.src_ip,
+    }
+}
+
+fn udp_ecn(ecn: proto::EcnCodepoint) -> udp::EcnCodepoint {
+    match ecn {
+        proto::EcnCodepoint::Ect0 => udp::EcnCodepoint::Ect0,
+        proto::EcnCodepoint::Ect1 => udp::EcnCodepoint::Ect1,
+        proto::EcnCodepoint::Ce => udp::EcnCodepoint::Ce,
+    }
 }
 
 /// Maximum number of datagrams processed in send/recv calls to make before moving on to other processing
@@ -117,11 +130,3 @@ const IO_LOOP_BOUND: usize = 160;
 /// Going much lower does not yield any noticeable difference, since a single `recvmmsg`
 /// batch of size 32 was observed to take 30us on some systems.
 const RECV_TIME_BOUND: Duration = Duration::from_micros(50);
-
-/// The maximum amount of time that should be spent in `sendmsg()` calls per endpoint iteration
-const SEND_TIME_BOUND: Duration = Duration::from_micros(50);
-
-/// The maximum size of content length of packets in the outgoing transmit queue. Transmit packets
-/// generated from the endpoint (retry or initial close) can be dropped when this limit is being execeeded.
-/// Chose to represent 100 MB of data.
-const MAX_TRANSMIT_QUEUE_CONTENTS_LEN: usize = 100_000_000;

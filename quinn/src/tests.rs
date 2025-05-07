@@ -1,4 +1,9 @@
-#![cfg(feature = "rustls")]
+#![cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
+
+#[cfg(all(feature = "rustls-aws-lc-rs", not(feature = "rustls-ring")))]
+use rustls::crypto::aws_lc_rs::default_provider;
+#[cfg(feature = "rustls-ring")]
+use rustls::crypto::ring::default_provider;
 
 use std::{
     convert::TryInto,
@@ -9,17 +14,20 @@ use std::{
 };
 
 use crate::runtime::TokioRuntime;
+use crate::{Duration, Instant};
 use bytes::Bytes;
-use rand::{rngs::StdRng, RngCore, SeedableRng};
-use tokio::{
-    runtime::{Builder, Runtime},
-    time::{Duration, Instant},
+use proto::{RandomConnectionIdGenerator, crypto::rustls::QuicClientConfig};
+use rand::{RngCore, SeedableRng, rngs::StdRng};
+use rustls::{
+    RootCertStore,
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
 };
+use tokio::runtime::{Builder, Runtime};
 use tracing::{error_span, info};
 use tracing_futures::Instrument as _;
 use tracing_subscriber::EnvFilter;
 
-use super::{ClientConfig, Endpoint, RecvStream, SendStream, TransportConfig};
+use super::{ClientConfig, Endpoint, EndpointConfig, RecvStream, SendStream, TransportConfig};
 
 #[test]
 fn handshake_timeout() {
@@ -30,8 +38,12 @@ fn handshake_timeout() {
         Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap()
     };
 
-    let mut client_config =
-        crate::ClientConfig::with_root_certificates(rustls::RootCertStore::empty());
+    // Avoid NoRootAnchors error
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(cert.cert.into()).unwrap();
+
+    let mut client_config = crate::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
     const IDLE_TIMEOUT: Duration = Duration::from_millis(500);
     let mut transport_config = crate::TransportConfig::default();
     transport_config
@@ -62,11 +74,16 @@ fn handshake_timeout() {
 #[tokio::test]
 async fn close_endpoint() {
     let _guard = subscribe();
+
+    // Avoid NoRootAnchors error
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(cert.cert.into()).unwrap();
+
     let mut endpoint =
         Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
-    endpoint.set_default_client_config(ClientConfig::with_root_certificates(
-        rustls::RootCertStore::empty(),
-    ));
+    endpoint
+        .set_default_client_config(ClientConfig::with_root_certificates(Arc::new(roots)).unwrap());
 
     let conn = endpoint
         .connect(
@@ -97,7 +114,7 @@ async fn close_endpoint() {
 
 #[test]
 fn local_addr() {
-    let socket = UdpSocket::bind("[::1]:0").unwrap();
+    let socket = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
     let addr = socket.local_addr().unwrap();
     let runtime = rt_basic();
     let ep = {
@@ -131,7 +148,9 @@ fn read_after_close() {
             .expect("connection");
         let mut s = new_conn.open_uni().await.unwrap();
         s.write_all(MSG).await.unwrap();
-        s.finish().await.unwrap();
+        s.finish().unwrap();
+        // Wait for the stream to be closed, one way or another.
+        _ = s.stopped().await;
     });
     runtime.block_on(async move {
         let new_conn = endpoint
@@ -139,12 +158,9 @@ fn read_after_close() {
             .unwrap()
             .await
             .expect("connect");
-        tokio::time::sleep_until(Instant::now() + Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let mut stream = new_conn.accept_uni().await.expect("incoming streams");
-        let msg = stream
-            .read_to_end(usize::max_value())
-            .await
-            .expect("read_to_end");
+        let msg = stream.read_to_end(usize::MAX).await.expect("read_to_end");
         assert_eq!(msg, MSG);
     });
 }
@@ -159,17 +175,29 @@ fn export_keying_material() {
     };
 
     runtime.block_on(async move {
-        let outgoing_conn = endpoint
-            .connect(endpoint.local_addr().unwrap(), "localhost")
-            .unwrap()
-            .await
-            .expect("connect");
-        let incoming_conn = endpoint
-            .accept()
-            .await
-            .expect("endpoint")
-            .await
-            .expect("connection");
+        let outgoing_conn_fut = tokio::spawn({
+            let endpoint = endpoint.clone();
+            async move {
+                endpoint
+                    .connect(endpoint.local_addr().unwrap(), "localhost")
+                    .unwrap()
+                    .await
+                    .expect("connect")
+            }
+        });
+        let incoming_conn_fut = tokio::spawn({
+            let endpoint = endpoint.clone();
+            async move {
+                endpoint
+                    .accept()
+                    .await
+                    .expect("endpoint")
+                    .await
+                    .expect("connection")
+            }
+        });
+        let outgoing_conn = outgoing_conn_fut.await.unwrap();
+        let incoming_conn = incoming_conn_fut.await.unwrap();
         let mut i_buf = [0u8; 64];
         incoming_conn
             .export_keying_material(&mut i_buf, b"asdf", b"qwer")
@@ -183,70 +211,98 @@ fn export_keying_material() {
 }
 
 #[tokio::test]
-async fn accept_after_close() {
+async fn ip_blocking() {
     let _guard = subscribe();
-    let endpoint = endpoint();
-
-    const MSG: &[u8] = b"goodbye!";
-
-    let sender = endpoint
-        .connect(endpoint.local_addr().unwrap(), "localhost")
-        .unwrap()
-        .await
-        .expect("connect");
-    let mut s = sender.open_uni().await.unwrap();
-    s.write_all(MSG).await.unwrap();
-    s.finish().await.unwrap();
-    sender.close(0u32.into(), b"");
-
-    // Allow some time for the close to be sent and processed
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Despite the connection having closed, we should be able to accept it...
-    let receiver = endpoint
-        .accept()
-        .await
-        .expect("endpoint")
-        .await
-        .expect("connection");
-
-    // ...and read what was sent.
-    let mut stream = receiver.accept_uni().await.expect("incoming streams");
-    let msg = stream
-        .read_to_end(usize::max_value())
-        .await
-        .expect("read_to_end");
-    assert_eq!(msg, MSG);
-
-    // But it's still definitely closed.
-    assert!(receiver.open_uni().await.is_err());
+    let endpoint_factory = EndpointFactory::new();
+    let client_1 = endpoint_factory.endpoint();
+    let client_1_addr = client_1.local_addr().unwrap();
+    let client_2 = endpoint_factory.endpoint();
+    let server = endpoint_factory.endpoint();
+    let server_addr = server.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        loop {
+            let accepting = server.accept().await.unwrap();
+            if accepting.remote_address() == client_1_addr {
+                accepting.refuse();
+            } else if accepting.remote_address_validated() {
+                accepting.await.expect("connection");
+            } else {
+                accepting.retry().unwrap();
+            }
+        }
+    });
+    tokio::join!(
+        async move {
+            let e = client_1
+                .connect(server_addr, "localhost")
+                .unwrap()
+                .await
+                .expect_err("server should have blocked this");
+            assert!(
+                matches!(e, crate::ConnectionError::ConnectionClosed(_)),
+                "wrong error"
+            );
+        },
+        async move {
+            client_2
+                .connect(server_addr, "localhost")
+                .unwrap()
+                .await
+                .expect("connect");
+        }
+    );
+    server_task.abort();
 }
 
 /// Construct an endpoint suitable for connecting to itself
 fn endpoint() -> Endpoint {
-    endpoint_with_config(TransportConfig::default())
+    EndpointFactory::new().endpoint()
 }
 
 fn endpoint_with_config(transport_config: TransportConfig) -> Endpoint {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let key = rustls::PrivateKey(cert.serialize_private_key_der());
-    let cert = rustls::Certificate(cert.serialize_der().unwrap());
-    let transport_config = Arc::new(transport_config);
-    let mut server_config = crate::ServerConfig::with_single_cert(vec![cert.clone()], key).unwrap();
-    server_config.transport_config(transport_config.clone());
+    EndpointFactory::new().endpoint_with_config(transport_config)
+}
 
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(&cert).unwrap();
-    let mut endpoint = Endpoint::server(
-        server_config,
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-    )
-    .unwrap();
-    let mut client_config = ClientConfig::with_root_certificates(roots);
-    client_config.transport_config(transport_config);
-    endpoint.set_default_client_config(client_config);
+/// Constructs endpoints suitable for connecting to themselves and each other
+struct EndpointFactory {
+    cert: rcgen::CertifiedKey,
+    endpoint_config: EndpointConfig,
+}
 
-    endpoint
+impl EndpointFactory {
+    fn new() -> Self {
+        Self {
+            cert: rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap(),
+            endpoint_config: EndpointConfig::default(),
+        }
+    }
+
+    fn endpoint(&self) -> Endpoint {
+        self.endpoint_with_config(TransportConfig::default())
+    }
+
+    fn endpoint_with_config(&self, transport_config: TransportConfig) -> Endpoint {
+        let key = PrivateKeyDer::Pkcs8(self.cert.key_pair.serialize_der().into());
+        let transport_config = Arc::new(transport_config);
+        let mut server_config =
+            crate::ServerConfig::with_single_cert(vec![self.cert.cert.der().clone()], key).unwrap();
+        server_config.transport_config(transport_config.clone());
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(self.cert.cert.der().clone()).unwrap();
+        let mut endpoint = Endpoint::new(
+            self.endpoint_config.clone(),
+            Some(server_config),
+            UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap(),
+            Arc::new(TokioRuntime),
+        )
+        .unwrap();
+        let mut client_config = ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        client_config.transport_config(transport_config);
+        endpoint.set_default_client_config(client_config);
+
+        endpoint
+    }
 }
 
 #[tokio::test]
@@ -259,25 +315,25 @@ async fn zero_rtt() {
     let endpoint2 = endpoint.clone();
     tokio::spawn(async move {
         for _ in 0..2 {
-            let incoming = endpoint2.accept().await.unwrap();
+            let incoming = endpoint2.accept().await.unwrap().accept().unwrap();
             let (connection, established) = incoming.into_0rtt().unwrap_or_else(|_| unreachable!());
             let c = connection.clone();
             tokio::spawn(async move {
                 while let Ok(mut x) = c.accept_uni().await {
-                    let msg = x.read_to_end(usize::max_value()).await.unwrap();
+                    let msg = x.read_to_end(usize::MAX).await.unwrap();
                     assert_eq!(msg, MSG0);
                 }
             });
             info!("sending 0.5-RTT");
             let mut s = connection.open_uni().await.expect("open_uni");
             s.write_all(MSG0).await.expect("write");
-            s.finish().await.expect("finish");
+            s.finish().unwrap();
             established.await;
             info!("sending 1-RTT");
             let mut s = connection.open_uni().await.expect("open_uni");
             s.write_all(MSG1).await.expect("write");
             // The peer might close the connection before ACKing
-            let _ = s.finish().await;
+            let _ = s.finish();
         }
     });
 
@@ -292,18 +348,12 @@ async fn zero_rtt() {
 
     {
         let mut stream = connection.accept_uni().await.expect("incoming streams");
-        let msg = stream
-            .read_to_end(usize::max_value())
-            .await
-            .expect("read_to_end");
+        let msg = stream.read_to_end(usize::MAX).await.expect("read_to_end");
         assert_eq!(msg, MSG0);
         // Read a 1-RTT message to ensure the handshake completes fully, allowing the server's
         // NewSessionTicket frame to be received.
         let mut stream = connection.accept_uni().await.expect("incoming streams");
-        let msg = stream
-            .read_to_end(usize::max_value())
-            .await
-            .expect("read_to_end");
+        let msg = stream.read_to_end(usize::MAX).await.expect("read_to_end");
         assert_eq!(msg, MSG1);
         drop(connection);
     }
@@ -321,14 +371,11 @@ async fn zero_rtt() {
         let mut s = c.open_uni().await.expect("0-RTT open uni");
         info!("sending 0-RTT");
         s.write_all(MSG0).await.expect("0-RTT write");
-        s.finish().await.expect("0-RTT finish");
+        s.finish().unwrap();
     });
 
     let mut stream = connection.accept_uni().await.expect("incoming streams");
-    let msg = stream
-        .read_to_end(usize::max_value())
-        .await
-        .expect("read_to_end");
+    let msg = stream.read_to_end(usize::MAX).await.expect("read_to_end");
     assert_eq!(msg, MSG0);
     assert!(zero_rtt.await);
 
@@ -338,6 +385,10 @@ async fn zero_rtt() {
 }
 
 #[test]
+#[cfg_attr(
+    any(target_os = "solaris", target_os = "illumos"),
+    ignore = "Fails on Solaris and Illumos"
+)]
 fn echo_v6() {
     run_echo(EchoArgs {
         client_addr: SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
@@ -350,6 +401,7 @@ fn echo_v6() {
 }
 
 #[test]
+#[cfg_attr(target_os = "solaris", ignore = "Sometimes hangs in poll() on Solaris")]
 fn echo_v4() {
     run_echo(EchoArgs {
         client_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
@@ -362,7 +414,7 @@ fn echo_v4() {
 }
 
 #[test]
-#[cfg(any(target_os = "linux", target_os = "macos"))] // Dual-stack sockets aren't the default anywhere else.
+#[cfg_attr(target_os = "solaris", ignore = "Hangs in poll() on Solaris")]
 fn echo_dualstack() {
     run_echo(EchoArgs {
         client_addr: SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
@@ -375,7 +427,8 @@ fn echo_dualstack() {
 }
 
 #[test]
-#[cfg(not(tarpaulin))]
+#[ignore]
+#[cfg_attr(target_os = "solaris", ignore = "Hangs in poll() on Solaris")]
 fn stress_receive_window() {
     run_echo(EchoArgs {
         client_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
@@ -388,7 +441,8 @@ fn stress_receive_window() {
 }
 
 #[test]
-#[cfg(not(tarpaulin))]
+#[ignore]
+#[cfg_attr(target_os = "solaris", ignore = "Hangs in poll() on Solaris")]
 fn stress_stream_receive_window() {
     // Note that there is no point in running this with too many streams,
     // since the window is only active within a stream.
@@ -403,7 +457,8 @@ fn stress_stream_receive_window() {
 }
 
 #[test]
-#[cfg(not(tarpaulin))]
+#[ignore]
+#[cfg_attr(target_os = "solaris", ignore = "Hangs in poll() on Solaris")]
 fn stress_both_windows() {
     run_echo(EchoArgs {
         client_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
@@ -434,11 +489,10 @@ fn run_echo(args: EchoArgs) {
         // We don't use the `endpoint` helper here because we want two different endpoints with
         // different addresses.
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let key = rustls::PrivateKey(cert.serialize_private_key_der());
-        let cert_der = cert.serialize_der().unwrap();
-        let cert = rustls::Certificate(cert_der);
+        let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let cert = CertificateDer::from(cert.cert);
         let mut server_config =
-            crate::ServerConfig::with_single_cert(vec![cert.clone()], key).unwrap();
+            crate::ServerConfig::with_single_cert(vec![cert.clone()], key.into()).unwrap();
 
         server_config.transport = transport_config.clone();
         let server_sock = UdpSocket::bind(args.server_addr).unwrap();
@@ -456,11 +510,13 @@ fn run_echo(args: EchoArgs) {
         };
 
         let mut roots = rustls::RootCertStore::empty();
-        roots.add(&cert).unwrap();
-        let mut client_crypto = rustls::ClientConfig::builder()
-            .with_safe_defaults()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        roots.add(cert).unwrap();
+        let mut client_crypto =
+            rustls::ClientConfig::builder_with_provider(default_provider().into())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
         client_crypto.key_log = Arc::new(rustls::KeyLogFile::new());
 
         let mut client = {
@@ -468,7 +524,8 @@ fn run_echo(args: EchoArgs) {
             let _guard = error_span!("client").entered();
             Endpoint::client(args.client_addr).unwrap()
         };
-        let mut client_config = ClientConfig::new(Arc::new(client_crypto));
+        let mut client_config =
+            ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto).unwrap()));
         client_config.transport_config(transport_config);
         client.set_default_client_config(client_config);
 
@@ -478,9 +535,12 @@ fn run_echo(args: EchoArgs) {
             // Note for anyone modifying the platform support in this test:
             // If `local_ip` gets available on additional platforms - which
             // requires modifying this test - please update the list of supported
-            // platforms in the doc comments of the various `local_ip` functions.
+            // platforms in the doc comment of `quinn_udp::RecvMeta::dst_ip`.
             if cfg!(target_os = "linux")
+                || cfg!(target_os = "android")
                 || cfg!(target_os = "freebsd")
+                || cfg!(target_os = "openbsd")
+                || cfg!(target_os = "netbsd")
                 || cfg!(target_os = "macos")
                 || cfg!(target_os = "windows")
             {
@@ -518,10 +578,9 @@ fn run_echo(args: EchoArgs) {
 
                     let send_task = async {
                         send.write_all(&msg).await.expect("write");
-                        send.finish().await.expect("finish");
+                        send.finish().unwrap();
                     };
-                    let recv_task =
-                        async { recv.read_to_end(usize::max_value()).await.expect("read") };
+                    let recv_task = async { recv.read_to_end(usize::MAX).await.expect("read") };
 
                     let (_, data) = tokio::join!(send_task, recv_task);
 
@@ -571,7 +630,7 @@ async fn echo((mut send, mut recv): (SendStream, RecvStream)) {
         }
     }
 
-    let _ = send.finish().await;
+    let _ = send.finish();
 }
 
 fn gen_data(size: usize, seed: u64) -> Vec<u8> {
@@ -617,19 +676,14 @@ async fn rebind_recv() {
     let _guard = subscribe();
 
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let key = rustls::PrivateKey(cert.serialize_private_key_der());
-    let cert = rustls::Certificate(cert.serialize_der().unwrap());
+    let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let cert = CertificateDer::from(cert.cert);
 
     let mut roots = rustls::RootCertStore::empty();
-    roots.add(&cert).unwrap();
+    roots.add(cert.clone()).unwrap();
 
     let mut client = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
-    let mut client_config = ClientConfig::new(Arc::new(
-        rustls::ClientConfig::builder()
-            .with_safe_defaults()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    ));
+    let mut client_config = ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
     client_config.transport_config(Arc::new({
         let mut cfg = TransportConfig::default();
         cfg.max_concurrent_uni_streams(1u32.into());
@@ -637,12 +691,16 @@ async fn rebind_recv() {
     }));
     client.set_default_client_config(client_config);
 
-    let server_config = crate::ServerConfig::with_single_cert(vec![cert.clone()], key).unwrap();
-    let server = Endpoint::server(
-        server_config,
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-    )
-    .unwrap();
+    let server_config =
+        crate::ServerConfig::with_single_cert(vec![cert.clone()], key.into()).unwrap();
+    let server = {
+        let _guard = tracing::error_span!("server").entered();
+        Endpoint::server(
+            server_config,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        )
+        .unwrap()
+    };
     let server_addr = server.local_addr().unwrap();
 
     const MSG: &[u8; 5] = b"hello";
@@ -658,14 +716,19 @@ async fn rebind_recv() {
         write_recv.notified().await;
         let mut stream = connection.open_uni().await.unwrap();
         stream.write_all(MSG).await.unwrap();
-        stream.finish().await.unwrap();
+        stream.finish().unwrap();
+        // Wait for the stream to be closed, one way or another.
+        _ = stream.stopped().await;
     });
 
-    let connection = client
-        .connect(server_addr, "localhost")
-        .unwrap()
-        .await
-        .unwrap();
+    let connection = {
+        let _guard = tracing::error_span!("client").entered();
+        client
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap()
+    };
     info!("connected");
     connected_recv.notified().await;
     client
@@ -741,9 +804,60 @@ async fn two_datagram_readers() {
         async {
             server.send_datagram(b"one"[..].into()).unwrap();
             done.notified().await;
-            server.send_datagram(b"two"[..].into()).unwrap();
+            server.send_datagram_wait(b"two"[..].into()).await.unwrap();
         }
     );
     assert!(*a == *b"one" || *b == *b"one");
     assert!(*a == *b"two" || *b == *b"two");
+}
+
+#[tokio::test]
+async fn multiple_conns_with_zero_length_cids() {
+    let _guard = subscribe();
+    let mut factory = EndpointFactory::new();
+    factory
+        .endpoint_config
+        .cid_generator(|| Box::new(RandomConnectionIdGenerator::new(0)));
+    let server = {
+        let _guard = error_span!("server").entered();
+        factory.endpoint()
+    };
+    let server_addr = server.local_addr().unwrap();
+
+    let client1 = {
+        let _guard = error_span!("client1").entered();
+        factory.endpoint()
+    };
+    let client2 = {
+        let _guard = error_span!("client2").entered();
+        factory.endpoint()
+    };
+
+    let client1 = async move {
+        let conn = client1
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        conn.closed().await;
+    }
+    .instrument(error_span!("client1"));
+    let client2 = async move {
+        let conn = client2
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        conn.closed().await;
+    }
+    .instrument(error_span!("client2"));
+    let server = async move {
+        let client1 = server.accept().await.unwrap().await.unwrap();
+        let client2 = server.accept().await.unwrap().await.unwrap();
+        // Both connections are now concurrently live.
+        client1.close(42u32.into(), &[]);
+        client2.close(42u32.into(), &[]);
+    }
+    .instrument(error_span!("server"));
+    tokio::join!(client1, client2, server);
 }

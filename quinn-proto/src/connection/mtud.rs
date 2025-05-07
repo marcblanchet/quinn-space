@@ -1,5 +1,5 @@
-use crate::{packet::SpaceId, MtuDiscoveryConfig, MAX_UDP_PAYLOAD};
-use std::time::Instant;
+use crate::{Instant, MAX_UDP_PAYLOAD, MtuDiscoveryConfig, packet::SpaceId};
+use std::cmp;
 use tracing::trace;
 
 /// Implements Datagram Packetization Layer Path Maximum Transmission Unit Discovery
@@ -56,16 +56,25 @@ impl MtuDiscovery {
         }
     }
 
+    pub(super) fn reset(&mut self, current_mtu: u16, min_mtu: u16) {
+        self.current_mtu = current_mtu;
+        if let Some(state) = self.state.take() {
+            self.state = Some(EnabledMtuDiscovery::new(state.config));
+            self.on_peer_max_udp_payload_size_received(state.peer_max_udp_payload_size);
+        }
+        self.black_hole_detector = BlackHoleDetector::new(min_mtu);
+    }
+
     /// Returns the current MTU
     pub(crate) fn current_mtu(&self) -> u16 {
         self.current_mtu
     }
 
     /// Returns the amount of bytes that should be sent as an MTU probe, if any
-    pub(crate) fn poll_transmit(&mut self, now: Instant, next_packet_number: u64) -> Option<u16> {
+    pub(crate) fn poll_transmit(&mut self, now: Instant, next_pn: u64) -> Option<u16> {
         self.state
             .as_mut()
-            .and_then(|state| state.poll_transmit(now, self.current_mtu, next_packet_number))
+            .and_then(|state| state.poll_transmit(now, self.current_mtu, next_pn))
     }
 
     /// Notifies the [`MtuDiscovery`] that the peer's `max_udp_payload_size` transport parameter has
@@ -84,12 +93,7 @@ impl MtuDiscovery {
     /// Notifies the [`MtuDiscovery`] that a packet has been ACKed
     ///
     /// Returns true if the packet was an MTU probe
-    pub(crate) fn on_acked(
-        &mut self,
-        space: SpaceId,
-        packet_number: u64,
-        packet_bytes: u16,
-    ) -> bool {
+    pub(crate) fn on_acked(&mut self, space: SpaceId, pn: u64, len: u16) -> bool {
         // MTU probes are only sent in application data space
         if space != SpaceId::Data {
             return false;
@@ -99,19 +103,15 @@ impl MtuDiscovery {
         if let Some(new_mtu) = self
             .state
             .as_mut()
-            .and_then(|state| state.on_probe_acked(packet_number))
+            .and_then(|state| state.on_probe_acked(pn))
         {
             self.current_mtu = new_mtu;
             trace!(current_mtu = self.current_mtu, "new MTU detected");
 
-            self.black_hole_detector.on_probe_acked();
+            self.black_hole_detector.on_probe_acked(pn, len);
             true
         } else {
-            self.black_hole_detector.on_non_probe_acked(
-                self.current_mtu,
-                packet_number,
-                packet_bytes,
-            );
+            self.black_hole_detector.on_non_probe_acked(pn, len);
             false
         }
     }
@@ -139,9 +139,8 @@ impl MtuDiscovery {
     /// When done notifying of lost packets, [`MtuDiscovery::black_hole_detected`] must be called, to
     /// ensure the last loss burst is properly processed and to trigger black hole recovery logic if
     /// necessary.
-    pub(crate) fn on_non_probe_lost(&mut self, packet_number: u64, packet_bytes: u16) {
-        self.black_hole_detector
-            .on_non_probe_lost(packet_number, packet_bytes);
+    pub(crate) fn on_non_probe_lost(&mut self, pn: u64, len: u16) {
+        self.black_hole_detector.on_non_probe_lost(pn, len);
     }
 
     /// Returns true if a black hole was detected
@@ -181,12 +180,7 @@ impl EnabledMtuDiscovery {
     }
 
     /// Returns the amount of bytes that should be sent as an MTU probe, if any
-    fn poll_transmit(
-        &mut self,
-        now: Instant,
-        current_mtu: u16,
-        next_packet_number: u64,
-    ) -> Option<u16> {
+    fn poll_transmit(&mut self, now: Instant, current_mtu: u16, next_pn: u64) -> Option<u16> {
         if let Phase::Initial = &self.phase {
             // Start the first search
             self.phase = Phase::Searching(SearchState::new(
@@ -215,7 +209,7 @@ impl EnabledMtuDiscovery {
 
             // Retransmit lost probes, if any
             if 0 < state.lost_probe_count && state.lost_probe_count < MAX_PROBE_RETRANSMITS {
-                state.in_flight_probe = Some(next_packet_number);
+                state.in_flight_probe = Some(next_pn);
                 return Some(state.last_probed_mtu);
             }
 
@@ -228,7 +222,7 @@ impl EnabledMtuDiscovery {
             }
 
             if let Some(probe_udp_payload_size) = state.next_mtu_to_probe(last_probe_succeeded) {
-                state.in_flight_probe = Some(next_packet_number);
+                state.in_flight_probe = Some(next_pn);
                 state.last_probed_mtu = probe_udp_payload_size;
                 return Some(probe_udp_payload_size);
             } else {
@@ -244,9 +238,9 @@ impl EnabledMtuDiscovery {
     /// Called when a packet is acknowledged in [`SpaceId::Data`]
     ///
     /// Returns the new `current_mtu` if the packet number corresponds to the in-flight MTU probe
-    fn on_probe_acked(&mut self, packet_number: u64) -> Option<u16> {
+    fn on_probe_acked(&mut self, pn: u64) -> Option<u16> {
         match &mut self.phase {
-            Phase::Searching(state) if state.in_flight_probe == Some(packet_number) => {
+            Phase::Searching(state) if state.in_flight_probe == Some(pn) => {
                 state.in_flight_probe = None;
                 state.lost_probe_count = 0;
                 Some(state.last_probed_mtu)
@@ -350,30 +344,32 @@ impl SearchState {
     }
 }
 
+/// Judges whether packet loss might indicate a drop in MTU
+///
+/// Our MTU black hole detection scheme is a heuristic based on the order in which packets were sent
+/// (the packet number order), their sizes, and which are deemed lost.
+///
+/// First, contiguous groups of lost packets ("loss bursts") are aggregated, because a group of
+/// packets all lost together were probably lost for the same reason.
+///
+/// A loss burst is deemed "suspicious" if it contains no packets that are (a) smaller than the
+/// minimum MTU or (b) smaller than a more recent acknowledged packet, because such a burst could be
+/// fully explained by a reduction in MTU.
+///
+/// When the number of suspicious loss bursts exceeds [`BLACK_HOLE_THRESHOLD`], we judge the
+/// evidence for an MTU black hole to be sufficient.
 #[derive(Clone)]
 struct BlackHoleDetector {
-    /// Counts suspicious packet loss bursts since a packet with size equal to the current MTU was
-    /// acknowledged (or since a black hole was detected)
-    ///
-    /// A packet loss burst is a group of contiguous packets that are deemed lost at the same time
-    /// (see usages of [`MtuDiscovery::on_non_probe_lost`] for details on how loss detection is
-    /// implemented)
-    ///
-    /// A packet loss burst is considered suspicious when it contains only suspicious packets and no
-    /// MTU-sized packet has been acknowledged since the group's packets were sent
-    suspicious_loss_bursts: u8,
-    /// Indicates whether the current loss burst has any non-suspicious packets
-    ///
-    /// Non-suspicious packets are non-probe packets of size <= `min_mtu`
-    loss_burst_has_non_suspicious_packets: bool,
-    /// The largest suspicious packet that was lost in the current burst
-    ///
-    /// Suspicious packets are non-probe packets of size > `min_mtu`
-    largest_suspicious_packet_lost: Option<u64>,
-    /// The largest non-probe packet that was lost (used to keep track of loss bursts)
-    largest_non_probe_lost: Option<u64>,
-    /// The largest acked packet of size `current_mtu`
-    largest_acked_mtu_sized_packet: Option<u64>,
+    /// Packet loss bursts currently considered suspicious
+    suspicious_loss_bursts: Vec<LossBurst>,
+    /// Loss burst currently being aggregated, if any
+    current_loss_burst: Option<CurrentLossBurst>,
+    /// Packet number of the biggest packet larger than `min_mtu` which we've received
+    /// acknowledgment of more recently than any suspicious loss burst, if any
+    largest_post_loss_packet: u64,
+    /// The maximum of `min_mtu` and the size of `largest_post_loss_packet`, or exactly `min_mtu` if
+    /// no larger packets have been received since the most recent loss burst.
+    acked_mtu: u16,
     /// The UDP payload size guaranteed to be supported by the network
     min_mtu: u16,
 }
@@ -381,111 +377,151 @@ struct BlackHoleDetector {
 impl BlackHoleDetector {
     fn new(min_mtu: u16) -> Self {
         Self {
-            suspicious_loss_bursts: 0,
-            largest_non_probe_lost: None,
-            loss_burst_has_non_suspicious_packets: false,
-            largest_suspicious_packet_lost: None,
-            largest_acked_mtu_sized_packet: None,
+            suspicious_loss_bursts: Vec::with_capacity(BLACK_HOLE_THRESHOLD + 1),
+            current_loss_burst: None,
+            largest_post_loss_packet: 0,
+            acked_mtu: min_mtu,
             min_mtu,
         }
     }
 
-    fn on_probe_acked(&mut self) {
-        // We know for sure the path supports the current MTU
-        self.suspicious_loss_bursts = 0;
+    fn on_probe_acked(&mut self, pn: u64, len: u16) {
+        // MTU probes are always larger than the previous MTU, so no previous loss bursts are
+        // suspicious. At most one MTU probe is in flight at a time, so we don't need to worry about
+        // reordering between them.
+        self.suspicious_loss_bursts.clear();
+        self.acked_mtu = len;
+        // This might go backwards, but that's okay: a successful ACK means we haven't yet judged a
+        // more recently sent packet lost, and we just want to track the largest packet that's been
+        // successfully delivered more recently than a loss.
+        self.largest_post_loss_packet = pn;
     }
 
-    fn on_non_probe_acked(&mut self, current_mtu: u16, packet_number: u64, packet_bytes: u16) {
-        // Reset the black hole counter if a packet the size of the current MTU or larger
-        // has been acknowledged
-        if packet_bytes >= current_mtu
-            && self
-                .largest_acked_mtu_sized_packet
-                .map_or(true, |pn| packet_number > pn)
-        {
-            self.suspicious_loss_bursts = 0;
-            self.largest_acked_mtu_sized_packet = Some(packet_number);
+    fn on_non_probe_acked(&mut self, pn: u64, len: u16) {
+        if len <= self.acked_mtu {
+            // We've already seen a larger packet since the most recent suspicious loss burst;
+            // nothing to do.
+            return;
         }
+        self.acked_mtu = len;
+        // This might go backwards, but that's okay as described in `on_probe_acked`.
+        self.largest_post_loss_packet = pn;
+        // Loss bursts packets smaller than this are retroactively deemed non-suspicious.
+        self.suspicious_loss_bursts
+            .retain(|burst| burst.smallest_packet_size > len);
     }
 
-    fn on_non_probe_lost(&mut self, packet_number: u64, packet_bytes: u16) {
+    fn on_non_probe_lost(&mut self, pn: u64, len: u16) {
         // A loss burst is a group of consecutive packets that are declared lost, so a distance
         // greater than 1 indicates a new burst
-        let new_loss_burst = self
-            .largest_non_probe_lost
-            .map_or(true, |prev| packet_number - prev != 1);
+        let end_last_burst = self
+            .current_loss_burst
+            .as_ref()
+            .is_some_and(|current| pn - current.latest_non_probe != 1);
 
-        if new_loss_burst {
+        if end_last_burst {
             self.finish_loss_burst();
         }
 
-        if packet_bytes <= self.min_mtu {
-            self.loss_burst_has_non_suspicious_packets = true;
-        } else {
-            self.largest_suspicious_packet_lost = Some(packet_number);
-        }
-
-        self.largest_non_probe_lost = Some(packet_number);
+        self.current_loss_burst = Some(CurrentLossBurst {
+            latest_non_probe: pn,
+            smallest_packet_size: self
+                .current_loss_burst
+                .map_or(len, |prev| cmp::min(prev.smallest_packet_size, len)),
+        });
     }
 
     fn black_hole_detected(&mut self) -> bool {
         self.finish_loss_burst();
 
-        if self.suspicious_loss_bursts <= BLACK_HOLE_THRESHOLD {
+        if self.suspicious_loss_bursts.len() <= BLACK_HOLE_THRESHOLD {
             return false;
         }
 
-        self.suspicious_loss_bursts = 0;
-        self.largest_acked_mtu_sized_packet = None;
+        self.suspicious_loss_bursts.clear();
 
         true
     }
 
     /// Marks the end of the current loss burst, checking whether it was suspicious
     fn finish_loss_burst(&mut self) {
-        if self.last_burst_was_suspicious() {
-            self.suspicious_loss_bursts = self.suspicious_loss_bursts.saturating_add(1);
-        }
-
-        self.loss_burst_has_non_suspicious_packets = false;
-        self.largest_suspicious_packet_lost = None;
-        self.largest_non_probe_lost = None;
-    }
-
-    /// Returns true if the burst was suspicious and should count towards black hole detection
-    fn last_burst_was_suspicious(&self) -> bool {
-        // Ignore burst if it contains any non-suspicious packets, because in that case packet loss
-        // was likely caused by congestion (instead of a sudden decrease in the path's MTU)
-        if self.loss_burst_has_non_suspicious_packets {
-            return false;
-        }
-
-        // Ignore burst if we have received an ACK for a more recent MTU-sized packet, because that
-        // proves the network still supports the current MTU
-        let largest_acked = self.largest_acked_mtu_sized_packet.unwrap_or(0);
-        if self
-            .largest_suspicious_packet_lost
-            .map_or(true, |largest_lost| largest_lost < largest_acked)
+        let Some(burst) = self.current_loss_burst.take() else {
+            return;
+        };
+        // If a loss burst contains a packet smaller than the minimum MTU or a more recently
+        // transmitted packet, it is not suspicious.
+        if burst.smallest_packet_size < self.min_mtu
+            || (burst.latest_non_probe < self.largest_post_loss_packet
+                && burst.smallest_packet_size < self.acked_mtu)
         {
-            return false;
+            return;
+        }
+        // The loss burst is now deemed suspicious.
+
+        // A suspicious loss burst more recent than `largest_post_loss_packet` invalidates it. This
+        // makes `acked_mtu` a conservative approximation. Ideally we'd update `safe_mtu` and
+        // `largest_post_loss_packet` to describe the largest acknowledged packet sent later than
+        // this burst, but that would require tracking the size of an unpredictable number of
+        // recently acknowledged packets, and erring on the side of false positives is safe.
+        if burst.latest_non_probe > self.largest_post_loss_packet {
+            self.acked_mtu = self.min_mtu;
         }
 
-        true
+        let burst = LossBurst {
+            smallest_packet_size: burst.smallest_packet_size,
+        };
+
+        if self.suspicious_loss_bursts.len() <= BLACK_HOLE_THRESHOLD {
+            self.suspicious_loss_bursts.push(burst);
+            return;
+        }
+
+        // To limit memory use, only track the most suspicious loss bursts.
+        let smallest = self
+            .suspicious_loss_bursts
+            .iter_mut()
+            .min_by_key(|prev| prev.smallest_packet_size)
+            .filter(|prev| prev.smallest_packet_size < burst.smallest_packet_size);
+        if let Some(smallest) = smallest {
+            *smallest = burst;
+        }
     }
+
+    #[cfg(test)]
+    fn suspicious_loss_burst_count(&self) -> usize {
+        self.suspicious_loss_bursts.len()
+    }
+
+    #[cfg(test)]
+    fn largest_non_probe_lost(&self) -> Option<u64> {
+        self.current_loss_burst.as_ref().map(|x| x.latest_non_probe)
+    }
+}
+
+#[derive(Copy, Clone)]
+struct LossBurst {
+    smallest_packet_size: u16,
+}
+
+#[derive(Copy, Clone)]
+struct CurrentLossBurst {
+    smallest_packet_size: u16,
+    latest_non_probe: u64,
 }
 
 // Corresponds to the RFC's `MAX_PROBES` constant (see
 // https://www.rfc-editor.org/rfc/rfc8899#section-5.1.2)
 const MAX_PROBE_RETRANSMITS: usize = 3;
-const BLACK_HOLE_THRESHOLD: u8 = 3;
+/// Maximum number of suspicious loss bursts that will not trigger black hole detection
+const BLACK_HOLE_THRESHOLD: usize = 3;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet::SpaceId;
+    use crate::Duration;
     use crate::MAX_UDP_PAYLOAD;
+    use crate::packet::SpaceId;
     use assert_matches::assert_matches;
-    use std::time::Duration;
 
     fn default_mtud() -> MtuDiscovery {
         let config = MtuDiscoveryConfig::default();
@@ -503,8 +539,8 @@ mod tests {
         link_payload_size_limit: u16,
     ) -> Vec<u16> {
         let mut probed_sizes = Vec::new();
-        for probe_packet_number in 1..100 {
-            let result = mtud.poll_transmit(now, probe_packet_number);
+        for probe_pn in 1..100 {
+            let result = mtud.poll_transmit(now, probe_pn);
 
             if completed(mtud) {
                 break;
@@ -516,7 +552,7 @@ mod tests {
             probed_sizes.push(probe_size);
 
             if probe_size <= link_payload_size_limit {
-                mtud.on_acked(SpaceId::Data, probe_packet_number, probe_size);
+                mtud.on_acked(SpaceId::Data, probe_pn, probe_size);
             } else {
                 mtud.on_probe_lost();
             }
@@ -529,19 +565,13 @@ mod tests {
         let mut mtud = default_mtud();
         mtud.on_non_probe_lost(2, 1300);
         mtud.on_non_probe_lost(3, 1300);
-        assert_eq!(
-            mtud.black_hole_detector.largest_suspicious_packet_lost,
-            Some(3)
-        );
-        assert_eq!(mtud.black_hole_detector.suspicious_loss_bursts, 0);
+        assert_eq!(mtud.black_hole_detector.largest_non_probe_lost(), Some(3));
+        assert_eq!(mtud.black_hole_detector.suspicious_loss_burst_count(), 0);
 
         mtud.on_non_probe_lost(4, 800);
         assert!(!mtud.black_hole_detected(Instant::now()));
-        assert_eq!(
-            mtud.black_hole_detector.largest_suspicious_packet_lost,
-            None
-        );
-        assert_eq!(mtud.black_hole_detector.suspicious_loss_bursts, 0);
+        assert_eq!(mtud.black_hole_detector.largest_non_probe_lost(), None);
+        assert_eq!(mtud.black_hole_detector.suspicious_loss_burst_count(), 0);
     }
 
     #[test]
@@ -549,25 +579,19 @@ mod tests {
         let mut mtud = default_mtud();
         mtud.on_non_probe_lost(2, 1300);
         mtud.on_non_probe_lost(3, 1300);
-        assert_eq!(
-            mtud.black_hole_detector.largest_suspicious_packet_lost,
-            Some(3)
-        );
-        assert_eq!(mtud.black_hole_detector.suspicious_loss_bursts, 0);
+        assert_eq!(mtud.black_hole_detector.largest_non_probe_lost(), Some(3));
+        assert_eq!(mtud.black_hole_detector.suspicious_loss_burst_count(), 0);
 
         assert!(!mtud.black_hole_detected(Instant::now()));
-        assert_eq!(
-            mtud.black_hole_detector.largest_suspicious_packet_lost,
-            None
-        );
-        assert_eq!(mtud.black_hole_detector.suspicious_loss_bursts, 1);
+        assert_eq!(mtud.black_hole_detector.largest_non_probe_lost(), None);
+        assert_eq!(mtud.black_hole_detector.suspicious_loss_burst_count(), 1);
     }
 
     #[test]
     fn black_hole_detector_ignores_empty_burst() {
         let mut mtud = default_mtud();
         assert!(!mtud.black_hole_detected(Instant::now()));
-        assert_eq!(mtud.black_hole_detector.suspicious_loss_bursts, 0);
+        assert_eq!(mtud.black_hole_detector.suspicious_loss_burst_count(), 0);
     }
 
     #[test]
@@ -707,6 +731,7 @@ mod tests {
         assert!(completed(&mtud));
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic]
     fn mtu_discovery_with_peer_max_udp_payload_size_after_search_panics() {
@@ -767,10 +792,10 @@ mod tests {
         for i in 1..100 {
             iterations += 1;
 
-            let probe_packet_number = i * 2 - 1;
-            let other_packet_number = i * 2;
+            let probe_pn = i * 2 - 1;
+            let other_pn = i * 2;
 
-            let result = mtud.poll_transmit(Instant::now(), probe_packet_number);
+            let result = mtud.poll_transmit(Instant::now(), probe_pn);
 
             if completed(&mtud) {
                 break;
@@ -781,12 +806,12 @@ mod tests {
             assert!(mtud.in_flight_mtu_probe().is_some());
 
             // Nothing else to send while the probe is in-flight
-            assert_matches!(mtud.poll_transmit(now, other_packet_number), None);
+            assert_matches!(mtud.poll_transmit(now, other_pn), None);
 
             if i % 2 == 0 {
                 // ACK probe and ensure it results in an increase of current_mtu
                 let previous_max_size = mtud.current_mtu;
-                mtud.on_acked(SpaceId::Data, probe_packet_number, result.unwrap());
+                mtud.on_acked(SpaceId::Data, probe_pn, result.unwrap());
                 println!(
                     "ACK packet {}. Previous MTU = {previous_max_size}. New MTU = {}",
                     result.unwrap(),
@@ -831,5 +856,115 @@ mod tests {
         let state = SearchState::new(1200, 1450, &config);
         assert_eq!(state.lower_bound, 1200);
         assert_eq!(state.upper_bound, 1450);
+    }
+
+    // Loss of packets larger than have been acknowledged should indicate a black hole
+    #[test]
+    fn simple_black_hole_detection() {
+        let mut bhd = BlackHoleDetector::new(1200);
+        bhd.on_non_probe_acked((BLACK_HOLE_THRESHOLD + 1) as u64 * 2, 1300);
+        for i in 0..BLACK_HOLE_THRESHOLD {
+            bhd.on_non_probe_lost(i as u64 * 2, 1400);
+        }
+        // But not before `BLACK_HOLE_THRESHOLD + 1` bursts
+        assert!(!bhd.black_hole_detected());
+        bhd.on_non_probe_lost(BLACK_HOLE_THRESHOLD as u64 * 2, 1400);
+        assert!(bhd.black_hole_detected());
+    }
+
+    // Loss of packets followed in transmission order by confirmation of a larger packet should not
+    // indicate a black hole
+    #[test]
+    fn non_suspicious_bursts() {
+        let mut bhd = BlackHoleDetector::new(1200);
+        bhd.on_non_probe_acked((BLACK_HOLE_THRESHOLD + 1) as u64 * 2, 1500);
+        for i in 0..(BLACK_HOLE_THRESHOLD + 1) {
+            bhd.on_non_probe_lost(i as u64 * 2, 1400);
+        }
+        assert!(!bhd.black_hole_detected());
+    }
+
+    // Loss of packets smaller than have been acknowledged previously should still indicate a black
+    // hole
+    #[test]
+    fn dynamic_mtu_reduction() {
+        let mut bhd = BlackHoleDetector::new(1200);
+        bhd.on_non_probe_acked(0, 1500);
+        for i in 0..(BLACK_HOLE_THRESHOLD + 1) {
+            bhd.on_non_probe_lost(i as u64 * 2, 1400);
+        }
+        assert!(bhd.black_hole_detected());
+    }
+
+    // Bursts containing heterogeneous packets are judged based on the smallest
+    #[test]
+    fn mixed_non_suspicious_bursts() {
+        let mut bhd = BlackHoleDetector::new(1200);
+        bhd.on_non_probe_acked((BLACK_HOLE_THRESHOLD + 1) as u64 * 3, 1400);
+        for i in 0..(BLACK_HOLE_THRESHOLD + 1) {
+            bhd.on_non_probe_lost(i as u64 * 3, 1500);
+            bhd.on_non_probe_lost(i as u64 * 3 + 1, 1300);
+        }
+        assert!(!bhd.black_hole_detected());
+    }
+
+    // Multi-packet bursts are only counted once
+    #[test]
+    fn bursts_count_once() {
+        let mut bhd = BlackHoleDetector::new(1200);
+        bhd.on_non_probe_acked((BLACK_HOLE_THRESHOLD + 1) as u64 * 3, 1400);
+        for i in 0..(BLACK_HOLE_THRESHOLD) {
+            bhd.on_non_probe_lost(i as u64 * 3, 1500);
+            bhd.on_non_probe_lost(i as u64 * 3 + 1, 1500);
+        }
+        assert!(!bhd.black_hole_detected());
+        bhd.on_non_probe_lost(BLACK_HOLE_THRESHOLD as u64 * 3, 1500);
+        assert!(bhd.black_hole_detected());
+    }
+
+    // Non-suspicious bursts don't interfere with detection of suspicious bursts
+    #[test]
+    fn interleaved_bursts() {
+        let mut bhd = BlackHoleDetector::new(1200);
+        bhd.on_non_probe_acked((BLACK_HOLE_THRESHOLD + 1) as u64 * 4, 1400);
+        for i in 0..(BLACK_HOLE_THRESHOLD + 1) {
+            bhd.on_non_probe_lost(i as u64 * 4, 1500);
+            bhd.on_non_probe_lost(i as u64 * 4 + 2, 1300);
+        }
+        assert!(bhd.black_hole_detected());
+    }
+
+    // Bursts that are non-suspicious before a delivered packet become suspicious past it
+    #[test]
+    fn suspicious_after_acked() {
+        let mut bhd = BlackHoleDetector::new(1200);
+        bhd.on_non_probe_acked((BLACK_HOLE_THRESHOLD + 1) as u64 * 2, 1400);
+        for i in 0..(BLACK_HOLE_THRESHOLD + 1) {
+            bhd.on_non_probe_lost(i as u64 * 2, 1300);
+        }
+        assert!(
+            !bhd.black_hole_detected(),
+            "1300 byte losses preceding a 1400 byte delivery are not suspicious"
+        );
+        for i in 0..(BLACK_HOLE_THRESHOLD + 1) {
+            bhd.on_non_probe_lost((BLACK_HOLE_THRESHOLD as u64 + 1 + i as u64) * 2, 1300);
+        }
+        assert!(
+            bhd.black_hole_detected(),
+            "1300 byte losses following a 1400 byte delivery are suspicious"
+        );
+    }
+
+    // Acknowledgment of a packet marks prior loss bursts with the same packet size as
+    // non-suspicious
+    #[test]
+    fn retroactively_non_suspicious() {
+        let mut bhd = BlackHoleDetector::new(1200);
+        for i in 0..BLACK_HOLE_THRESHOLD {
+            bhd.on_non_probe_lost(i as u64 * 2, 1400);
+        }
+        bhd.on_non_probe_acked(BLACK_HOLE_THRESHOLD as u64 * 2, 1400);
+        bhd.on_non_probe_lost(BLACK_HOLE_THRESHOLD as u64 * 2 + 1, 1400);
+        assert!(!bhd.black_hole_detected());
     }
 }

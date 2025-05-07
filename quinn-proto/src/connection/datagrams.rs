@@ -1,14 +1,13 @@
 use std::collections::VecDeque;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use thiserror::Error;
 use tracing::{debug, trace};
 
 use super::Connection;
 use crate::{
-    frame::{Datagram, FrameStruct},
-    packet::SpaceId,
     TransportError,
+    frame::{Datagram, FrameStruct},
 };
 
 /// API to control datagram traffic
@@ -16,29 +15,42 @@ pub struct Datagrams<'a> {
     pub(super) conn: &'a mut Connection,
 }
 
-impl<'a> Datagrams<'a> {
+impl Datagrams<'_> {
     /// Queue an unreliable, unordered datagram for immediate transmission
     ///
-    /// Returns `Err` iff a `len`-byte datagram cannot currently be sent
-    pub fn send(&mut self, data: Bytes) -> Result<(), SendDatagramError> {
+    /// If `drop` is true, previously queued datagrams which are still unsent may be discarded to
+    /// make space for this datagram, in order of oldest to newest. If `drop` is false, and there
+    /// isn't enough space due to previously queued datagrams, this function will return
+    /// `SendDatagramError::Blocked`. `Event::DatagramsUnblocked` will be emitted once datagrams
+    /// have been sent.
+    ///
+    /// Returns `Err` iff a `len`-byte datagram cannot currently be sent.
+    pub fn send(&mut self, data: Bytes, drop: bool) -> Result<(), SendDatagramError> {
         if self.conn.config.datagram_receive_buffer_size.is_none() {
             return Err(SendDatagramError::Disabled);
         }
         let max = self
             .max_size()
             .ok_or(SendDatagramError::UnsupportedByPeer)?;
-        while self.conn.datagrams.outgoing_total > self.conn.config.datagram_send_buffer_size {
-            let prev = self
-                .conn
-                .datagrams
-                .outgoing
-                .pop_front()
-                .expect("datagrams.outgoing_total desynchronized");
-            trace!(len = prev.data.len(), "dropping outgoing datagram");
-            self.conn.datagrams.outgoing_total -= prev.data.len();
-        }
         if data.len() > max {
             return Err(SendDatagramError::TooLarge);
+        }
+        if drop {
+            while self.conn.datagrams.outgoing_total > self.conn.config.datagram_send_buffer_size {
+                let prev = self
+                    .conn
+                    .datagrams
+                    .outgoing
+                    .pop_front()
+                    .expect("datagrams.outgoing_total desynchronized");
+                trace!(len = prev.data.len(), "dropping outgoing datagram");
+                self.conn.datagrams.outgoing_total -= prev.data.len();
+            }
+        } else if self.conn.datagrams.outgoing_total + data.len()
+            > self.conn.config.datagram_send_buffer_size
+        {
+            self.conn.datagrams.send_blocked = true;
+            return Err(SendDatagramError::Blocked(data));
         }
         self.conn.datagrams.outgoing_total += data.len();
         self.conn.datagrams.outgoing.push_back(Datagram { data });
@@ -55,11 +67,11 @@ impl<'a> Datagrams<'a> {
     ///
     /// Not necessarily the maximum size of received datagrams.
     pub fn max_size(&self) -> Option<usize> {
+        // We use the conservative overhead bound for any packet number, reducing the budget by at
+        // most 3 bytes, so that PN size fluctuations don't cause users sending maximum-size
+        // datagrams to suffer avoidable packet loss.
         let max_size = self.conn.path.current_mtu() as usize
-            - 1                 // flags byte
-            - self.conn.rem_cids.active().len()
-            - 4                 // worst-case packet number size
-            - self.conn.spaces[SpaceId::Data].crypto.as_ref().map_or_else(|| &self.conn.zero_rtt_crypto.as_ref().unwrap().packet, |x| &x.packet.local).tag_len()
+            - self.conn.predict_1rtt_overhead(None)
             - Datagram::SIZE_BOUND;
         let limit = self
             .conn
@@ -95,6 +107,7 @@ pub(super) struct DatagramState {
     pub(super) incoming: VecDeque<Datagram>,
     pub(super) outgoing: VecDeque<Datagram>,
     pub(super) outgoing_total: usize,
+    pub(super) send_blocked: bool,
 }
 
 impl DatagramState {
@@ -127,7 +140,30 @@ impl DatagramState {
         Ok(was_empty)
     }
 
-    pub(super) fn write(&mut self, buf: &mut BytesMut, max_size: usize) -> bool {
+    /// Discard outgoing datagrams with a payload larger than `max_payload` bytes
+    ///
+    /// Used to ensure that reductions in MTU don't get us stuck in a state where we have a datagram
+    /// queued but can't send it.
+    pub(super) fn drop_oversized(&mut self, max_payload: usize) {
+        self.outgoing.retain(|datagram| {
+            let result = datagram.data.len() < max_payload;
+            if !result {
+                trace!(
+                    "dropping {} byte datagram violating {} byte limit",
+                    datagram.data.len(),
+                    max_payload
+                );
+                self.outgoing_total -= datagram.data.len();
+            }
+            result
+        });
+    }
+
+    /// Attempt to write a datagram frame into `buf`, consuming it from `self.outgoing`
+    ///
+    /// Returns whether a frame was written. At most `max_size` bytes will be written, including
+    /// framing.
+    pub(super) fn write(&mut self, buf: &mut Vec<u8>, max_size: usize) -> bool {
         let datagram = match self.outgoing.pop_front() {
             Some(x) => x,
             None => return false,
@@ -139,6 +175,8 @@ impl DatagramState {
             self.outgoing.push_front(datagram);
             return false;
         }
+
+        trace!(len = datagram.data.len(), "DATAGRAM");
 
         self.outgoing_total -= datagram.data.len();
         datagram.encode(true, buf);
@@ -167,4 +205,7 @@ pub enum SendDatagramError {
     /// exceeded.
     #[error("datagram too large")]
     TooLarge,
+    /// Send would block
+    #[error("datagram send blocked")]
+    Blocked(Bytes),
 }

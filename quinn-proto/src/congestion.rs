@@ -1,9 +1,9 @@
 //! Logic for controlling the rate at which data is sent
 
+use crate::Instant;
 use crate::connection::RttEstimator;
 use std::any::Any;
 use std::sync::Arc;
-use std::time::Instant;
 
 mod bbr;
 mod cubic;
@@ -16,7 +16,7 @@ pub use new_reno::{NewReno, NewRenoConfig};
 pub use no_cc::{NoCC, NoCCConfig};
 
 /// Common interface for different congestion controllers
-pub trait Controller: Send {
+pub trait Controller: Send + Sync {
     /// One or more packets were just sent
     #[allow(unused_variables)]
     fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {}

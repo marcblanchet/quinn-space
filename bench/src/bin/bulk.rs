@@ -6,14 +6,14 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use tokio::sync::Semaphore;
 use tracing::{info, trace};
 
 use bench::{
-    configure_tracing_subscriber, connect_client, drain_stream, rt, send_data_on_stream,
+    Opt, configure_tracing_subscriber, connect_client, drain_stream, rt, send_data_on_stream,
     server_endpoint,
     stats::{Stats, TransferResult},
-    Opt,
 };
 
 fn main() {
@@ -21,14 +21,14 @@ fn main() {
     configure_tracing_subscriber();
 
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let key = rustls::PrivateKey(cert.serialize_private_key_der());
-    let cert = rustls::Certificate(cert.serialize_der().unwrap());
+    let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let cert = CertificateDer::from(cert.cert);
 
     let server_span = tracing::error_span!("server");
     let runtime = rt();
     let (server_addr, endpoint) = {
         let _guard = server_span.enter();
-        server_endpoint(&runtime, cert.clone(), key, &opt)
+        server_endpoint(&runtime, cert.clone(), key.into(), &opt)
     };
 
     let server_thread = std::thread::spawn(move || {
@@ -111,7 +111,7 @@ async fn server(endpoint: quinn::Endpoint, opt: Opt) -> Result<()> {
 
 async fn client(
     server_addr: SocketAddr,
-    server_cert: rustls::Certificate,
+    server_cert: CertificateDer<'static>,
     opt: Opt,
 ) -> Result<ClientStats> {
     let (endpoint, connection) = connect_client(server_addr, server_cert, opt).await?;

@@ -1,19 +1,24 @@
-use std::{any::Any, convert::TryInto, io, str, sync::Arc};
+use std::{any::Any, io, str, sync::Arc};
 
+#[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
+use aws_lc_rs::aead;
 use bytes::BytesMut;
+#[cfg(feature = "ring")]
 use ring::aead;
 pub use rustls::Error;
 use rustls::{
-    self,
-    quic::{Connection, HeaderProtectionKey, KeyChange, PacketKey, Secrets, Version},
+    self, CipherSuite,
+    client::danger::ServerCertVerifier,
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName},
+    quic::{Connection, HeaderProtectionKey, KeyChange, PacketKey, Secrets, Suite, Version},
 };
 
 use crate::{
+    ConnectError, ConnectionId, Side, TransportError, TransportErrorCode,
     crypto::{
         self, CryptoError, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, UnsupportedVersion,
     },
     transport_parameters::TransportParameters,
-    ConnectError, ConnectionId, Side, TransportError, TransportErrorCode,
 };
 
 impl From<Side> for rustls::Side {
@@ -31,6 +36,7 @@ pub struct TlsSession {
     got_handshake_data: bool,
     next_secrets: Option<Secrets>,
     inner: Connection,
+    suite: Suite,
 }
 
 impl TlsSession {
@@ -44,7 +50,7 @@ impl TlsSession {
 
 impl crypto::Session for TlsSession {
     fn initial_keys(&self, dst_cid: &ConnectionId, side: Side) -> Keys {
-        initial_keys(self.version, dst_cid, side)
+        initial_keys(self.version, *dst_cid, side, &self.suite)
     }
 
     fn handshake_data(&self) -> Option<Box<dyn Any>> {
@@ -60,10 +66,15 @@ impl crypto::Session for TlsSession {
         }))
     }
 
+    /// For the rustls `TlsSession`, the `Any` type is `Vec<rustls::pki_types::CertificateDer>`
     fn peer_identity(&self) -> Option<Box<dyn Any>> {
-        self.inner
-            .peer_certificates()
-            .map(|v| -> Box<dyn Any> { Box::new(v.to_vec()) })
+        self.inner.peer_certificates().map(|v| -> Box<dyn Any> {
+            Box::new(
+                v.iter()
+                    .map(|v| v.clone().into_owned())
+                    .collect::<Vec<CertificateDer<'static>>>(),
+            )
+        })
     }
 
     fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn crypto::PacketKey>)> {
@@ -86,7 +97,7 @@ impl crypto::Session for TlsSession {
         self.inner.read_hs(buf).map_err(|e| {
             if let Some(alert) = self.inner.alert() {
                 TransportError {
-                    code: TransportErrorCode::crypto(alert.get_u8()),
+                    code: TransportErrorCode::crypto(alert.into()),
                     frame: None,
                     reason: e.to_string(),
                 }
@@ -204,7 +215,7 @@ const RETRY_INTEGRITY_NONCE_V1: [u8; 12] = [
     0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
 ];
 
-impl crypto::HeaderKey for HeaderProtectionKey {
+impl crypto::HeaderKey for Box<dyn HeaderProtectionKey> {
     fn decrypt(&self, pn_offset: usize, packet: &mut [u8]) {
         let (header, sample) = packet.split_at_mut(pn_offset + 4);
         let (first, rest) = header.split_at_mut(1);
@@ -246,7 +257,71 @@ pub struct HandshakeData {
     pub server_name: Option<String>,
 }
 
-impl crypto::ClientConfig for rustls::ClientConfig {
+/// A QUIC-compatible TLS client configuration
+///
+/// Quinn implicitly constructs a `QuicClientConfig` with reasonable defaults within
+/// [`ClientConfig::with_root_certificates()`][root_certs] and [`ClientConfig::with_platform_verifier()`][platform].
+/// Alternatively, `QuicClientConfig`'s [`TryFrom`] implementation can be used to wrap around a
+/// custom [`rustls::ClientConfig`], in which case care should be taken around certain points:
+///
+/// - If `enable_early_data` is not set to true, then sending 0-RTT data will not be possible on
+///   outgoing connections.
+/// - The [`rustls::ClientConfig`] must have TLS 1.3 support enabled for conversion to succeed.
+///
+/// The object in the `resumption` field of the inner [`rustls::ClientConfig`] determines whether
+/// calling `into_0rtt` on outgoing connections returns `Ok` or `Err`. It typically allows
+/// `into_0rtt` to proceed if it recognizes the server name, and defaults to an in-memory cache of
+/// 256 server names.
+///
+/// [root_certs]: crate::config::ClientConfig::with_root_certificates()
+/// [platform]: crate::config::ClientConfig::with_platform_verifier()
+pub struct QuicClientConfig {
+    pub(crate) inner: Arc<rustls::ClientConfig>,
+    initial: Suite,
+}
+
+impl QuicClientConfig {
+    /// Initialize a sane QUIC-compatible TLS client configuration
+    ///
+    /// QUIC requires that TLS 1.3 be enabled. Advanced users can use any [`rustls::ClientConfig`] that
+    /// satisfies this requirement.
+    pub(crate) fn new(verifier: Arc<dyn ServerCertVerifier>) -> Self {
+        let inner = Self::inner(verifier);
+        Self {
+            // We're confident that the *ring* default provider contains TLS13_AES_128_GCM_SHA256
+            initial: initial_suite_from_provider(inner.crypto_provider())
+                .expect("no initial cipher suite found"),
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Initialize a QUIC-compatible TLS client configuration with a separate initial cipher suite
+    ///
+    /// This is useful if you want to avoid the initial cipher suite for traffic encryption.
+    pub fn with_initial(
+        inner: Arc<rustls::ClientConfig>,
+        initial: Suite,
+    ) -> Result<Self, NoInitialCipherSuite> {
+        match initial.suite.common.suite {
+            CipherSuite::TLS13_AES_128_GCM_SHA256 => Ok(Self { inner, initial }),
+            _ => Err(NoInitialCipherSuite { specific: true }),
+        }
+    }
+
+    pub(crate) fn inner(verifier: Arc<dyn ServerCertVerifier>) -> rustls::ClientConfig {
+        let mut config = rustls::ClientConfig::builder_with_provider(configured_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap() // The default providers support TLS 1.3
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+
+        config.enable_early_data = true;
+        config
+    }
+}
+
+impl crypto::ClientConfig for QuicClientConfig {
     fn start_session(
         self: Arc<Self>,
         version: u32,
@@ -260,33 +335,165 @@ impl crypto::ClientConfig for rustls::ClientConfig {
             next_secrets: None,
             inner: rustls::quic::Connection::Client(
                 rustls::quic::ClientConnection::new(
-                    self,
+                    self.inner.clone(),
                     version,
-                    server_name
-                        .try_into()
-                        .map_err(|_| ConnectError::InvalidDnsName(server_name.into()))?,
+                    ServerName::try_from(server_name)
+                        .map_err(|_| ConnectError::InvalidServerName(server_name.into()))?
+                        .to_owned(),
                     to_vec(params),
                 )
                 .unwrap(),
             ),
+            suite: self.initial,
         }))
     }
 }
 
-impl crypto::ServerConfig for rustls::ServerConfig {
+impl TryFrom<rustls::ClientConfig> for QuicClientConfig {
+    type Error = NoInitialCipherSuite;
+
+    fn try_from(inner: rustls::ClientConfig) -> Result<Self, Self::Error> {
+        Arc::new(inner).try_into()
+    }
+}
+
+impl TryFrom<Arc<rustls::ClientConfig>> for QuicClientConfig {
+    type Error = NoInitialCipherSuite;
+
+    fn try_from(inner: Arc<rustls::ClientConfig>) -> Result<Self, Self::Error> {
+        Ok(Self {
+            initial: initial_suite_from_provider(inner.crypto_provider())
+                .ok_or(NoInitialCipherSuite { specific: false })?,
+            inner,
+        })
+    }
+}
+
+/// The initial cipher suite (AES-128-GCM-SHA256) is not available
+///
+/// When the cipher suite is supplied `with_initial()`, it must be
+/// [`CipherSuite::TLS13_AES_128_GCM_SHA256`]. When the cipher suite is derived from a config's
+/// [`CryptoProvider`][provider], that provider must reference a cipher suite with the same ID.
+///
+/// [provider]: rustls::crypto::CryptoProvider
+#[derive(Clone, Debug)]
+pub struct NoInitialCipherSuite {
+    /// Whether the initial cipher suite was supplied by the caller
+    specific: bool,
+}
+
+impl std::fmt::Display for NoInitialCipherSuite {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(match self.specific {
+            true => "invalid cipher suite specified",
+            false => "no initial cipher suite found",
+        })
+    }
+}
+
+impl std::error::Error for NoInitialCipherSuite {}
+
+/// A QUIC-compatible TLS server configuration
+///
+/// Quinn implicitly constructs a `QuicServerConfig` with reasonable defaults within
+/// [`ServerConfig::with_single_cert()`][single]. Alternatively, `QuicServerConfig`'s [`TryFrom`]
+/// implementation or `with_initial` method can be used to wrap around a custom
+/// [`rustls::ServerConfig`], in which case care should be taken around certain points:
+///
+/// - If `max_early_data_size` is not set to `u32::MAX`, the server will not be able to accept
+///   incoming 0-RTT data. QUIC prohibits `max_early_data_size` values other than 0 or `u32::MAX`.
+/// - The `rustls::ServerConfig` must have TLS 1.3 support enabled for conversion to succeed.
+///
+/// [single]: crate::config::ServerConfig::with_single_cert()
+pub struct QuicServerConfig {
+    inner: Arc<rustls::ServerConfig>,
+    initial: Suite,
+}
+
+impl QuicServerConfig {
+    pub(crate) fn new(
+        cert_chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<Self, rustls::Error> {
+        let inner = Self::inner(cert_chain, key)?;
+        Ok(Self {
+            // We're confident that the *ring* default provider contains TLS13_AES_128_GCM_SHA256
+            initial: initial_suite_from_provider(inner.crypto_provider())
+                .expect("no initial cipher suite found"),
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// Initialize a QUIC-compatible TLS client configuration with a separate initial cipher suite
+    ///
+    /// This is useful if you want to avoid the initial cipher suite for traffic encryption.
+    pub fn with_initial(
+        inner: Arc<rustls::ServerConfig>,
+        initial: Suite,
+    ) -> Result<Self, NoInitialCipherSuite> {
+        match initial.suite.common.suite {
+            CipherSuite::TLS13_AES_128_GCM_SHA256 => Ok(Self { inner, initial }),
+            _ => Err(NoInitialCipherSuite { specific: true }),
+        }
+    }
+
+    /// Initialize a sane QUIC-compatible TLS server configuration
+    ///
+    /// QUIC requires that TLS 1.3 be enabled, and that the maximum early data size is either 0 or
+    /// `u32::MAX`. Advanced users can use any [`rustls::ServerConfig`] that satisfies these
+    /// requirements.
+    pub(crate) fn inner(
+        cert_chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<rustls::ServerConfig, rustls::Error> {
+        let mut inner = rustls::ServerConfig::builder_with_provider(configured_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap() // The *ring* default provider supports TLS 1.3
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)?;
+
+        inner.max_early_data_size = u32::MAX;
+        Ok(inner)
+    }
+}
+
+impl TryFrom<rustls::ServerConfig> for QuicServerConfig {
+    type Error = NoInitialCipherSuite;
+
+    fn try_from(inner: rustls::ServerConfig) -> Result<Self, Self::Error> {
+        Arc::new(inner).try_into()
+    }
+}
+
+impl TryFrom<Arc<rustls::ServerConfig>> for QuicServerConfig {
+    type Error = NoInitialCipherSuite;
+
+    fn try_from(inner: Arc<rustls::ServerConfig>) -> Result<Self, Self::Error> {
+        Ok(Self {
+            initial: initial_suite_from_provider(inner.crypto_provider())
+                .ok_or(NoInitialCipherSuite { specific: false })?,
+            inner,
+        })
+    }
+}
+
+impl crypto::ServerConfig for QuicServerConfig {
     fn start_session(
         self: Arc<Self>,
         version: u32,
         params: &TransportParameters,
     ) -> Box<dyn crypto::Session> {
+        // Safe: `start_session()` is never called if `initial_keys()` rejected `version`
         let version = interpret_version(version).unwrap();
         Box::new(TlsSession {
             version,
             got_handshake_data: false,
             next_secrets: None,
             inner: rustls::quic::Connection::Server(
-                rustls::quic::ServerConnection::new(self, version, to_vec(params)).unwrap(),
+                rustls::quic::ServerConnection::new(self.inner.clone(), version, to_vec(params))
+                    .unwrap(),
             ),
+            suite: self.initial,
         })
     }
 
@@ -294,13 +501,13 @@ impl crypto::ServerConfig for rustls::ServerConfig {
         &self,
         version: u32,
         dst_cid: &ConnectionId,
-        side: Side,
     ) -> Result<Keys, UnsupportedVersion> {
         let version = interpret_version(version)?;
-        Ok(initial_keys(version, dst_cid, side))
+        Ok(initial_keys(version, *dst_cid, Side::Server, &self.initial))
     }
 
     fn retry_tag(&self, version: u32, orig_dst_cid: &ConnectionId, packet: &[u8]) -> [u8; 16] {
+        // Safe: `start_session()` is never called if `initial_keys()` rejected `version`
         let version = interpret_version(version).unwrap();
         let (nonce, key) = match version {
             Version::V1 => (RETRY_INTEGRITY_NONCE_V1, RETRY_INTEGRITY_KEY_V1),
@@ -325,14 +532,42 @@ impl crypto::ServerConfig for rustls::ServerConfig {
     }
 }
 
+pub(crate) fn initial_suite_from_provider(
+    provider: &Arc<rustls::crypto::CryptoProvider>,
+) -> Option<Suite> {
+    provider
+        .cipher_suites
+        .iter()
+        .find_map(|cs| match (cs.suite(), cs.tls13()) {
+            (rustls::CipherSuite::TLS13_AES_128_GCM_SHA256, Some(suite)) => {
+                Some(suite.quic_suite())
+            }
+            _ => None,
+        })
+        .flatten()
+}
+
+pub(crate) fn configured_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    #[cfg(all(feature = "rustls-aws-lc-rs", not(feature = "rustls-ring")))]
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    #[cfg(feature = "rustls-ring")]
+    let provider = rustls::crypto::ring::default_provider();
+    Arc::new(provider)
+}
+
 fn to_vec(params: &TransportParameters) -> Vec<u8> {
     let mut bytes = Vec::new();
     params.write(&mut bytes);
     bytes
 }
 
-pub(crate) fn initial_keys(version: Version, dst_cid: &ConnectionId, side: Side) -> Keys {
-    let keys = rustls::quic::Keys::initial(version, dst_cid, side.into());
+pub(crate) fn initial_keys(
+    version: Version,
+    dst_cid: ConnectionId,
+    side: Side,
+    suite: &Suite,
+) -> Keys {
+    let keys = suite.keys(&dst_cid, side.into(), version);
     Keys {
         header: KeyPair {
             local: Box::new(keys.local.header),
@@ -345,7 +580,7 @@ pub(crate) fn initial_keys(version: Version, dst_cid: &ConnectionId, side: Side)
     }
 }
 
-impl crypto::PacketKey for PacketKey {
+impl crypto::PacketKey for Box<dyn PacketKey> {
     fn encrypt(&self, packet: u64, buf: &mut [u8], header_len: usize) {
         let (header, payload_tag) = buf.split_at_mut(header_len);
         let (payload, tag_storage) = payload_tag.split_at_mut(payload_tag.len() - self.tag_len());
@@ -368,52 +603,16 @@ impl crypto::PacketKey for PacketKey {
     }
 
     fn tag_len(&self) -> usize {
-        self.tag_len()
+        (**self).tag_len()
     }
 
     fn confidentiality_limit(&self) -> u64 {
-        self.confidentiality_limit()
+        (**self).confidentiality_limit()
     }
 
     fn integrity_limit(&self) -> u64 {
-        self.integrity_limit()
+        (**self).integrity_limit()
     }
-}
-
-/// Initialize a sane QUIC-compatible TLS client configuration
-///
-/// QUIC requires that TLS 1.3 be enabled. Advanced users can use any [`rustls::ClientConfig`] that
-/// satisfies this requirement.
-pub(crate) fn client_config(roots: rustls::RootCertStore) -> rustls::ClientConfig {
-    let mut cfg = rustls::ClientConfig::builder()
-        .with_safe_default_cipher_suites()
-        .with_safe_default_kx_groups()
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    cfg.enable_early_data = true;
-    cfg
-}
-
-/// Initialize a sane QUIC-compatible TLS server configuration
-///
-/// QUIC requires that TLS 1.3 be enabled, and that the maximum early data size is either 0 or
-/// `u32::MAX`. Advanced users can use any [`rustls::ServerConfig`] that satisfies these
-/// requirements.
-pub(crate) fn server_config(
-    cert_chain: Vec<rustls::Certificate>,
-    key: rustls::PrivateKey,
-) -> Result<rustls::ServerConfig, Error> {
-    let mut cfg = rustls::ServerConfig::builder()
-        .with_safe_default_cipher_suites()
-        .with_safe_default_kx_groups()
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, key)?;
-    cfg.max_early_data_size = u32::MAX;
-    Ok(cfg)
 }
 
 fn interpret_version(version: u32) -> Result<Version, UnsupportedVersion> {

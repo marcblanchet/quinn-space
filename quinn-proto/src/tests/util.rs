@@ -1,6 +1,6 @@
 use std::{
     cmp,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     io::{self, Write},
     mem,
@@ -8,16 +8,21 @@ use std::{
     ops::RangeFrom,
     str,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
 };
 
 use assert_matches::assert_matches;
 use bytes::BytesMut;
 use lazy_static::lazy_static;
-use rustls::{Certificate, KeyLogFile, PrivateKey};
+use rustls::{
+    KeyLogFile,
+    client::WebPkiServerVerifier,
+    pki_types::{CertificateDer, PrivateKeyDer},
+};
 use tracing::{info_span, trace};
 
+use super::crypto::rustls::{QuicClientConfig, QuicServerConfig, configured_provider};
 use super::*;
+use crate::{Duration, Instant};
 
 pub(super) const DEFAULT_MTU: usize = 1452;
 
@@ -76,7 +81,7 @@ impl Pair {
             epoch: now,
             time: now,
             mtu: DEFAULT_MTU,
-            latency: Duration::new(0, 0),
+            latency: Duration::ZERO,
             spins: 0,
             last_spin: false,
             congestion_experienced: false,
@@ -207,7 +212,7 @@ impl Pair {
         let _guard = span.enter();
         let (client_ch, client_conn) = self
             .client
-            .connect(Instant::now(), config, self.server.addr, "localhost")
+            .connect(self.time, config, self.server.addr, "localhost")
             .unwrap();
         self.client.connections.insert(client_ch, client_conn);
         client_ch
@@ -220,7 +225,7 @@ impl Pair {
         );
         assert_matches!(
             self.client_conn_mut(client_ch).poll(),
-            Some(Event::Connected { .. })
+            Some(Event::Connected)
         );
         assert_matches!(
             self.server_conn_mut(server_ch).poll(),
@@ -228,7 +233,7 @@ impl Pair {
         );
         assert_matches!(
             self.server_conn_mut(server_ch).poll(),
-            Some(Event::Connected { .. })
+            Some(Event::Connected)
         );
     }
 
@@ -287,11 +292,29 @@ pub(super) struct TestEndpoint {
     pub(super) outbound: VecDeque<(Transmit, Bytes)>,
     delayed: VecDeque<(Transmit, Bytes)>,
     pub(super) inbound: VecDeque<(Instant, Option<EcnCodepoint>, BytesMut)>,
-    accepted: Option<ConnectionHandle>,
+    accepted: Option<Result<ConnectionHandle, ConnectionError>>,
     pub(super) connections: HashMap<ConnectionHandle, Connection>,
     conn_events: HashMap<ConnectionHandle, VecDeque<ConnectionEvent>>,
     pub(super) captured_packets: Vec<Vec<u8>>,
     pub(super) capture_inbound_packets: bool,
+    pub(super) handle_incoming: Box<dyn FnMut(&Incoming) -> IncomingConnectionBehavior>,
+    pub(super) waiting_incoming: Vec<Incoming>,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub(super) enum IncomingConnectionBehavior {
+    Accept,
+    Reject,
+    Retry,
+    Wait,
+}
+
+pub(super) fn validate_incoming(incoming: &Incoming) -> IncomingConnectionBehavior {
+    if incoming.remote_address_validated() {
+        IncomingConnectionBehavior::Accept
+    } else {
+        IncomingConnectionBehavior::Retry
+    }
 }
 
 impl TestEndpoint {
@@ -299,7 +322,7 @@ impl TestEndpoint {
         let socket = if env::var_os("SSLKEYLOGFILE").is_some() {
             let socket = UdpSocket::bind(addr).expect("failed to bind UDP socket");
             socket
-                .set_read_timeout(Some(Duration::new(0, 10_000_000)))
+                .set_read_timeout(Some(Duration::from_millis(10)))
                 .unwrap();
             Some(socket)
         } else {
@@ -318,6 +341,8 @@ impl TestEndpoint {
             conn_events: HashMap::default(),
             captured_packets: Vec::new(),
             capture_inbound_packets: false,
+            handle_incoming: Box::new(|_| IncomingConnectionBehavior::Accept),
+            waiting_incoming: Vec::new(),
         }
     }
 
@@ -336,18 +361,30 @@ impl TestEndpoint {
             }
         }
         let buffer_size = self.endpoint.config().get_max_udp_payload_size() as usize;
-        let mut buf = BytesMut::with_capacity(buffer_size);
+        let mut buf = Vec::with_capacity(buffer_size);
 
-        while self.inbound.front().map_or(false, |x| x.0 <= now) {
+        while self.inbound.front().is_some_and(|x| x.0 <= now) {
             let (recv_time, ecn, packet) = self.inbound.pop_front().unwrap();
             if let Some(event) = self
                 .endpoint
                 .handle(recv_time, remote, None, ecn, packet, &mut buf)
             {
                 match event {
-                    DatagramEvent::NewConnection(ch, conn) => {
-                        self.connections.insert(ch, conn);
-                        self.accepted = Some(ch);
+                    DatagramEvent::NewConnection(incoming) => {
+                        match (self.handle_incoming)(&incoming) {
+                            IncomingConnectionBehavior::Accept => {
+                                let _ = self.try_accept(incoming, now);
+                            }
+                            IncomingConnectionBehavior::Reject => {
+                                self.reject(incoming);
+                            }
+                            IncomingConnectionBehavior::Retry => {
+                                self.retry(incoming);
+                            }
+                            IncomingConnectionBehavior::Wait => {
+                                self.waiting_incoming.push(incoming);
+                            }
+                        }
                     }
                     DatagramEvent::ConnectionEvent(ch, event) => {
                         if self.capture_inbound_packets {
@@ -359,8 +396,8 @@ impl TestEndpoint {
                     }
                     DatagramEvent::Response(transmit) => {
                         let size = transmit.size;
-                        self.outbound
-                            .extend(split_transmit(transmit, buf.split_to(size).freeze()));
+                        self.outbound.extend(split_transmit(transmit, &buf[..size]));
+                        buf.clear();
                     }
                 }
             }
@@ -369,12 +406,12 @@ impl TestEndpoint {
 
     pub(super) fn drive_outgoing(&mut self, now: Instant) {
         let buffer_size = self.endpoint.config().get_max_udp_payload_size() as usize;
-        let mut buf = BytesMut::with_capacity(buffer_size);
+        let mut buf = Vec::with_capacity(buffer_size);
 
         loop {
             let mut endpoint_events: Vec<(ConnectionHandle, EndpointEvent)> = vec![];
             for (ch, conn) in self.connections.iter_mut() {
-                if self.timeout.map_or(false, |x| x <= now) {
+                if self.timeout.is_some_and(|x| x <= now) {
                     self.timeout = None;
                     conn.handle_timeout(now);
                 }
@@ -390,8 +427,8 @@ impl TestEndpoint {
                 }
                 while let Some(transmit) = conn.poll_transmit(now, MAX_DATAGRAMS, &mut buf) {
                     let size = transmit.size;
-                    self.outbound
-                        .extend(split_transmit(transmit, buf.split_to(size).freeze()));
+                    self.outbound.extend(split_transmit(transmit, &buf[..size]));
+                    buf.clear();
                 }
                 self.timeout = conn.poll_timeout();
             }
@@ -428,8 +465,55 @@ impl TestEndpoint {
         self.outbound.extend(self.delayed.drain(..));
     }
 
+    pub(super) fn try_accept(
+        &mut self,
+        incoming: Incoming,
+        now: Instant,
+    ) -> Result<ConnectionHandle, ConnectionError> {
+        let mut buf = Vec::new();
+        match self.endpoint.accept(incoming, now, &mut buf, None) {
+            Ok((ch, conn)) => {
+                self.connections.insert(ch, conn);
+                self.accepted = Some(Ok(ch));
+                Ok(ch)
+            }
+            Err(error) => {
+                if let Some(transmit) = error.response {
+                    let size = transmit.size;
+                    self.outbound.extend(split_transmit(transmit, &buf[..size]));
+                }
+                self.accepted = Some(Err(error.cause.clone()));
+                Err(error.cause)
+            }
+        }
+    }
+
+    pub(super) fn retry(&mut self, incoming: Incoming) {
+        let mut buf = Vec::new();
+        let transmit = self.endpoint.retry(incoming, &mut buf).unwrap();
+        let size = transmit.size;
+        self.outbound.extend(split_transmit(transmit, &buf[..size]));
+    }
+
+    pub(super) fn reject(&mut self, incoming: Incoming) {
+        let mut buf = Vec::new();
+        let transmit = self.endpoint.refuse(incoming, &mut buf);
+        let size = transmit.size;
+        self.outbound.extend(split_transmit(transmit, &buf[..size]));
+    }
+
     pub(super) fn assert_accept(&mut self) -> ConnectionHandle {
-        self.accepted.take().expect("server didn't connect")
+        self.accepted
+            .take()
+            .expect("server didn't try connecting")
+            .expect("server experienced error connecting")
+    }
+
+    pub(super) fn assert_accept_error(&mut self) -> ConnectionError {
+        self.accepted
+            .take()
+            .expect("server didn't try connecting")
+            .expect_err("server did unexpectedly connect without error")
     }
 
     pub(super) fn assert_no_accept(&self) {
@@ -451,11 +535,13 @@ impl ::std::ops::DerefMut for TestEndpoint {
 }
 
 pub(super) fn subscribe() -> tracing::subscriber::DefaultGuard {
-    let sub = tracing_subscriber::FmtSubscriber::builder()
+    let builder = tracing_subscriber::FmtSubscriber::builder()
         .with_max_level(tracing::Level::TRACE)
-        .with_writer(|| TestWriter)
-        .finish();
-    tracing::subscriber::set_default(sub)
+        .with_writer(|| TestWriter);
+    // tracing uses std::time to trace time, which panics in wasm.
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    let builder = builder.without_time();
+    tracing::subscriber::set_default(builder.finish())
 }
 
 struct TestWriter;
@@ -474,25 +560,64 @@ impl Write for TestWriter {
 }
 
 pub(super) fn server_config() -> ServerConfig {
-    ServerConfig::with_crypto(Arc::new(server_crypto()))
+    let mut config = ServerConfig::with_crypto(Arc::new(server_crypto()));
+    config
+        .validation_token
+        .sent(2)
+        .log(Arc::new(SimpleTokenLog::default()));
+    config
 }
 
-pub(super) fn server_config_with_cert(cert: Certificate, key: PrivateKey) -> ServerConfig {
-    ServerConfig::with_crypto(Arc::new(server_crypto_with_cert(cert, key)))
+pub(super) fn server_config_with_cert(
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+) -> ServerConfig {
+    let mut config = ServerConfig::with_crypto(Arc::new(server_crypto_with_cert(cert, key)));
+    config
+        .validation_token
+        .sent(2)
+        .log(Arc::new(SimpleTokenLog::default()));
+    config
 }
 
-pub(super) fn server_crypto() -> rustls::ServerConfig {
-    let cert = Certificate(CERTIFICATE.serialize_der().unwrap());
-    let key = PrivateKey(CERTIFICATE.serialize_private_key_der());
-    server_crypto_with_cert(cert, key)
+pub(super) fn server_crypto() -> QuicServerConfig {
+    server_crypto_inner(None, None)
 }
 
-pub(super) fn server_crypto_with_cert(cert: Certificate, key: PrivateKey) -> rustls::ServerConfig {
-    crate::crypto::rustls::server_config(vec![cert], key).unwrap()
+pub(super) fn server_crypto_with_alpn(alpn: Vec<Vec<u8>>) -> QuicServerConfig {
+    server_crypto_inner(None, Some(alpn))
+}
+
+pub(super) fn server_crypto_with_cert(
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+) -> QuicServerConfig {
+    server_crypto_inner(Some((cert, key)), None)
+}
+
+fn server_crypto_inner(
+    identity: Option<(CertificateDer<'static>, PrivateKeyDer<'static>)>,
+    alpn: Option<Vec<Vec<u8>>>,
+) -> QuicServerConfig {
+    let (cert, key) = identity.unwrap_or_else(|| {
+        (
+            CERTIFIED_KEY.cert.der().clone(),
+            PrivateKeyDer::Pkcs8(CERTIFIED_KEY.key_pair.serialize_der().into()),
+        )
+    });
+
+    let mut config = QuicServerConfig::inner(vec![cert], key).unwrap();
+    if let Some(alpn) = alpn {
+        config.alpn_protocols = alpn;
+    }
+
+    config.try_into().unwrap()
 }
 
 pub(super) fn client_config() -> ClientConfig {
-    ClientConfig::new(Arc::new(client_crypto()))
+    let mut config = ClientConfig::new(Arc::new(client_crypto()));
+    config.token_store(Arc::new(SimpleTokenStore::default()));
+    config
 }
 
 pub(super) fn client_config_with_deterministic_pns() -> ClientConfig {
@@ -503,23 +628,38 @@ pub(super) fn client_config_with_deterministic_pns() -> ClientConfig {
     cfg
 }
 
-pub(super) fn client_config_with_certs(certs: Vec<rustls::Certificate>) -> ClientConfig {
-    ClientConfig::new(Arc::new(client_crypto_with_certs(certs)))
+pub(super) fn client_config_with_certs(certs: Vec<CertificateDer<'static>>) -> ClientConfig {
+    ClientConfig::new(Arc::new(client_crypto_inner(Some(certs), None)))
 }
 
-pub(super) fn client_crypto() -> rustls::ClientConfig {
-    let cert = rustls::Certificate(CERTIFICATE.serialize_der().unwrap());
-    client_crypto_with_certs(vec![cert])
+pub(super) fn client_crypto() -> QuicClientConfig {
+    client_crypto_inner(None, None)
 }
 
-pub(super) fn client_crypto_with_certs(certs: Vec<rustls::Certificate>) -> rustls::ClientConfig {
+pub(super) fn client_crypto_with_alpn(protocols: Vec<Vec<u8>>) -> QuicClientConfig {
+    client_crypto_inner(None, Some(protocols))
+}
+
+fn client_crypto_inner(
+    certs: Option<Vec<CertificateDer<'static>>>,
+    alpn: Option<Vec<Vec<u8>>>,
+) -> QuicClientConfig {
     let mut roots = rustls::RootCertStore::empty();
-    for cert in certs {
-        roots.add(&cert).unwrap();
+    for cert in certs.unwrap_or_else(|| vec![CERTIFIED_KEY.cert.der().clone()]) {
+        roots.add(cert).unwrap();
     }
-    let mut config = crate::crypto::rustls::client_config(roots);
-    config.key_log = Arc::new(KeyLogFile::new());
-    config
+
+    let mut inner = QuicClientConfig::inner(
+        WebPkiServerVerifier::builder_with_provider(Arc::new(roots), configured_provider())
+            .build()
+            .unwrap(),
+    );
+    inner.key_log = Arc::new(KeyLogFile::new());
+    if let Some(alpn) = alpn {
+        inner.alpn_protocols = alpn;
+    }
+
+    inner.try_into().unwrap()
 }
 
 pub(super) fn min_opt<T: Ord>(x: Option<T>, y: Option<T>) -> Option<T> {
@@ -534,7 +674,8 @@ pub(super) fn min_opt<T: Ord>(x: Option<T>, y: Option<T>) -> Option<T> {
 /// The maximum of datagrams TestEndpoint will produce via `poll_transmit`
 const MAX_DATAGRAMS: usize = 10;
 
-fn split_transmit(transmit: Transmit, mut buffer: Bytes) -> Vec<(Transmit, Bytes)> {
+fn split_transmit(transmit: Transmit, buffer: &[u8]) -> Vec<(Transmit, Bytes)> {
+    let mut buffer = Bytes::copy_from_slice(buffer);
     let segment_size = match transmit.segment_size {
         Some(segment_size) => segment_size,
         _ => return vec![(transmit, buffer)],
@@ -548,7 +689,7 @@ fn split_transmit(transmit: Transmit, mut buffer: Bytes) -> Vec<(Transmit, Bytes
         transmits.push((
             Transmit {
                 destination: transmit.destination,
-                size: buffer.len(),
+                size: contents.len(),
                 ecn: transmit.ecn,
                 segment_size: None,
                 src_ip: transmit.src_ip,
@@ -581,6 +722,46 @@ fn set_congestion_experienced(
 lazy_static! {
     pub static ref SERVER_PORTS: Mutex<RangeFrom<u16>> = Mutex::new(4433..);
     pub static ref CLIENT_PORTS: Mutex<RangeFrom<u16>> = Mutex::new(44433..);
-    pub(crate) static ref CERTIFICATE: rcgen::Certificate =
+    pub(crate) static ref CERTIFIED_KEY: rcgen::CertifiedKey =
         rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+}
+
+#[derive(Default)]
+struct SimpleTokenLog(Mutex<HashSet<u128>>);
+
+impl TokenLog for SimpleTokenLog {
+    fn check_and_insert(
+        &self,
+        nonce: u128,
+        _issued: SystemTime,
+        _lifetime: Duration,
+    ) -> Result<(), TokenReuseError> {
+        if self.0.lock().unwrap().insert(nonce) {
+            Ok(())
+        } else {
+            Err(TokenReuseError)
+        }
+    }
+}
+
+#[derive(Default)]
+struct SimpleTokenStore(Mutex<HashMap<String, VecDeque<Bytes>>>);
+
+impl TokenStore for SimpleTokenStore {
+    fn insert(&self, server_name: &str, token: Bytes) {
+        self.0
+            .lock()
+            .unwrap()
+            .entry(server_name.into())
+            .or_default()
+            .push_back(token);
+    }
+
+    fn take(&self, server_name: &str) -> Option<Bytes> {
+        self.0
+            .lock()
+            .unwrap()
+            .get_mut(server_name)
+            .and_then(|queue| queue.pop_front())
+    }
 }

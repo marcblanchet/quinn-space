@@ -1,4 +1,4 @@
-use std::{cmp, net::SocketAddr, time::Duration, time::Instant};
+use std::{cmp, net::SocketAddr};
 
 use tracing::trace;
 
@@ -7,7 +7,7 @@ use super::{
     pacing::Pacer,
     spaces::{PacketSpace, SentPacket},
 };
-use crate::{config::MtuDiscoveryConfig, congestion, packet::SpaceId, TIMER_GRANULARITY};
+use crate::{Duration, Instant, TIMER_GRANULARITY, TransportConfig, congestion, packet::SpaceId};
 
 /// Description of a particular network path
 pub(super) struct PathData {
@@ -47,29 +47,46 @@ pub(super) struct PathData {
 impl PathData {
     pub(super) fn new(
         remote: SocketAddr,
-        initial_rtt: Duration,
-        congestion: Box<dyn congestion::Controller>,
-        initial_mtu: u16,
-        min_mtu: u16,
+        allow_mtud: bool,
         peer_max_udp_payload_size: Option<u16>,
-        mtud_config: Option<MtuDiscoveryConfig>,
         now: Instant,
-        validated: bool,
+        config: &TransportConfig,
     ) -> Self {
+        let congestion = config
+            .congestion_controller_factory
+            .clone()
+            .build(now, config.get_initial_mtu());
         Self {
             remote,
-            rtt: RttEstimator::new(initial_rtt),
+            rtt: RttEstimator::new(config.initial_rtt),
             sending_ecn: true,
-            pacing: Pacer::new(initial_rtt, congestion.initial_window(), initial_mtu, now),
+            pacing: Pacer::new(
+                config.initial_rtt,
+                congestion.initial_window(),
+                config.get_initial_mtu(),
+                now,
+            ),
             congestion,
             challenge: None,
             challenge_pending: false,
-            validated,
+            validated: false,
             total_sent: 0,
             total_recvd: 0,
-            mtud: mtud_config.map_or(MtuDiscovery::disabled(initial_mtu, min_mtu), |config| {
-                MtuDiscovery::new(initial_mtu, min_mtu, peer_max_udp_payload_size, config)
-            }),
+            mtud: config
+                .mtu_discovery_config
+                .as_ref()
+                .filter(|_| allow_mtud)
+                .map_or(
+                    MtuDiscovery::disabled(config.get_initial_mtu(), config.min_mtu),
+                    |mtud_config| {
+                        MtuDiscovery::new(
+                            config.get_initial_mtu(),
+                            config.min_mtu,
+                            peer_max_udp_payload_size,
+                            mtud_config.clone(),
+                        )
+                    },
+                ),
             first_packet_after_rtt_sample: None,
             in_flight: InFlight::new(),
             first_packet: None,
@@ -95,6 +112,18 @@ impl PathData {
             in_flight: InFlight::new(),
             first_packet: None,
         }
+    }
+
+    /// Resets RTT, congestion control and MTU states.
+    ///
+    /// This is useful when it is known the underlying path has changed.
+    pub(super) fn reset(&mut self, now: Instant, config: &TransportConfig) {
+        self.rtt = RttEstimator::new(config.initial_rtt);
+        self.congestion = config
+            .congestion_controller_factory
+            .clone()
+            .build(now, config.get_initial_mtu());
+        self.mtud.reset(config.get_initial_mtu(), config.min_mtu);
     }
 
     /// Indicates whether we're a server that hasn't validated the peer's address and hasn't
@@ -231,9 +260,9 @@ impl PathResponses {
         }
     }
 
-    pub(crate) fn pop_off_path(&mut self, remote: &SocketAddr) -> Option<(u64, SocketAddr)> {
+    pub(crate) fn pop_off_path(&mut self, remote: SocketAddr) -> Option<(u64, SocketAddr)> {
         let response = *self.pending.last()?;
-        if response.remote == *remote {
+        if response.remote == remote {
             // We don't bother searching further because we expect that the on-path response will
             // get drained in the immediate future by a call to `pop_on_path`
             return None;
@@ -242,9 +271,9 @@ impl PathResponses {
         Some((response.token, response.remote))
     }
 
-    pub(crate) fn pop_on_path(&mut self, remote: &SocketAddr) -> Option<u64> {
+    pub(crate) fn pop_on_path(&mut self, remote: SocketAddr) -> Option<u64> {
         let response = *self.pending.last()?;
-        if response.remote != *remote {
+        if response.remote != remote {
             // We don't bother searching further because we expect that the off-path response will
             // get drained in the immediate future by a call to `pop_off_path`
             return None;

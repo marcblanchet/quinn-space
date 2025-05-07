@@ -3,8 +3,12 @@ use std::sync::Arc;
 use bytes::BytesMut;
 
 use quinn_proto::{
-    crypto::{self, CryptoError},
-    transport_parameters, ConnectionId, Side, TransportError,
+    ConnectionId, Side, TransportError,
+    crypto::{
+        self, CryptoError,
+        rustls::{QuicClientConfig, QuicServerConfig},
+    },
+    transport_parameters,
 };
 
 /// A rustls TLS session which does not perform packet encryption/decryption (for debugging purpose)
@@ -39,21 +43,21 @@ impl NoProtectionPacketKey {
 }
 
 pub struct NoProtectionClientConfig {
-    inner: Arc<rustls::ClientConfig>,
+    inner: Arc<QuicClientConfig>,
 }
 
 impl NoProtectionClientConfig {
-    pub fn new(config: Arc<rustls::ClientConfig>) -> Self {
+    pub fn new(config: Arc<QuicClientConfig>) -> Self {
         Self { inner: config }
     }
 }
 
 pub struct NoProtectionServerConfig {
-    inner: Arc<rustls::ServerConfig>,
+    inner: Arc<QuicServerConfig>,
 }
 
 impl NoProtectionServerConfig {
-    pub fn new(config: Arc<rustls::ServerConfig>) -> Self {
+    pub fn new(config: Arc<QuicServerConfig>) -> Self {
         Self { inner: config }
     }
 }
@@ -146,9 +150,8 @@ impl crypto::ServerConfig for NoProtectionServerConfig {
         &self,
         version: u32,
         dst_cid: &ConnectionId,
-        side: Side,
     ) -> Result<crypto::Keys, crypto::UnsupportedVersion> {
-        self.inner.initial_keys(version, dst_cid, side)
+        self.inner.initial_keys(version, dst_cid)
     }
 
     fn retry_tag(&self, version: u32, orig_dst_cid: &ConnectionId, packet: &[u8]) -> [u8; 16] {

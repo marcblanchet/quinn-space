@@ -5,14 +5,16 @@
 use std::{
     fs,
     io::{self, Write},
-    net::ToSocketAddrs,
+    net::{SocketAddr, ToSocketAddrs},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use clap::Parser;
+use proto::crypto::rustls::QuicClientConfig;
+use rustls::pki_types::CertificateDer;
 use tracing::{error, info};
 use url::Url;
 use proto::congestion::BbrConfig;
@@ -44,6 +46,10 @@ struct Opt {
     /// Simulate NAT rebinding after connecting
     #[clap(long = "rebind")]
     rebind: bool,
+
+    /// Address to bind on
+    #[clap(long = "bind", default_value = "[::]:0")]
+    bind: SocketAddr,
 
     // sets the congestion control methods. Since cubic is default, options are:
     // "bbr" or "none".
@@ -107,12 +113,12 @@ async fn run(options: Opt) -> Result<()> {
 
     let mut roots = rustls::RootCertStore::empty();
     if let Some(ca_path) = options.ca {
-        roots.add(&rustls::Certificate(fs::read(ca_path)?))?;
+        roots.add(CertificateDer::from(fs::read(ca_path)?))?;
     } else {
         let dirs = directories_next::ProjectDirs::from("org", "quinn", "quinn-examples").unwrap();
         match fs::read(dirs.data_local_dir().join("cert.der")) {
             Ok(cert) => {
-                roots.add(&rustls::Certificate(cert))?;
+                roots.add(CertificateDer::from(cert))?;
             }
             Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
                 info!("local server certificate not found");
@@ -123,21 +129,17 @@ async fn run(options: Opt) -> Result<()> {
         }
     }
     let mut client_crypto = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        // wanted to use the Opt cli flag --insecure for selecting no cert check or not,
-        // but can't find how to do it with a builder.
-        .with_custom_certificate_verifier(SkipServerVerification::new())
-        //.with_root_certificates(roots)
+        .with_root_certificates(roots)
         .with_no_client_auth();
-
-    //client_crypto.dangerous();
 
     client_crypto.alpn_protocols = common::ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
     if options.keylog {
         client_crypto.key_log = Arc::new(rustls::KeyLogFile::new());
     }
 
-    let mut client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
+    let client_config =
+        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto)?));
+    let mut endpoint = quinn::Endpoint::client(options.bind)?;
     let transport_config = Arc::get_mut(&mut client_config.transport).unwrap();
      if options.dtn {
         transport_config.max_idle_timeout(Some(VarInt::MAX.into()));
@@ -193,54 +195,40 @@ async fn run(options: Opt) -> Result<()> {
     let host = options.host.as_deref().unwrap_or(url_host);
 
     eprintln!("connecting to {host} at {remote}");
-    eprintln!(" clock: {:?}", Utc::now());
     let conn = endpoint
         .connect(remote, host)?
         .await
         .map_err(|e| anyhow!("failed to connect: {}", e))?;
     eprintln!("connected at {:?}", start.elapsed());
-    eprintln!(" clock: {:?}", Utc::now());
-
-    let mut repeat = 1;
-    if let Some(repeating) = options.repeat { repeat = repeating; }
-    for n in 0..repeat {
-        eprintln!(" sending request #{} to remote at: {:?}", n, Utc::now());
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| anyhow!("failed to open stream: {}", e))?;
-        if rebind {
-            let socket = std::net::UdpSocket::bind("[::]:0").unwrap();
-            let addr = socket.local_addr().unwrap();
-            eprintln!("rebinding to {addr}");
-            endpoint.rebind(socket).expect("rebind failed");
-        }
-
-        send.write_all(request.as_bytes())
-            .await
-            .map_err(|e| anyhow!("failed to send request: {}", e))?;
-        send.finish()
-            .await
-            .map_err(|e| anyhow!("failed to shutdown stream: {}", e))?;
-        let response_start = Instant::now();
-        eprintln!("request sent at {:?}", response_start - start);
-        eprintln!(" clock: {:?}", Utc::now());
-        let resp = recv
-            .read_to_end(usize::max_value())
-            .await
-            .map_err(|e| anyhow!("failed to read response: {}", e))?;
-        let duration = response_start.elapsed();
-        eprintln!(
-            "response received in {:?} - {} KiB/s",
-            duration,
-            resp.len() as f32 / (duration_secs(&duration) * 1024.0)
-        );
-        eprintln!(" clock: {:?}", Utc::now());
-        io::stdout().write_all(&resp).unwrap();
-        io::stdout().flush().unwrap();
-        eprintln!("total time from start up to close: {:?}", start.elapsed());
-        eprintln!(" clock: {:?}", Utc::now());
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow!("failed to open stream: {}", e))?;
+    if rebind {
+        let socket = std::net::UdpSocket::bind("[::]:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        eprintln!("rebinding to {addr}");
+        endpoint.rebind(socket).expect("rebind failed");
     }
+
+    send.write_all(request.as_bytes())
+        .await
+        .map_err(|e| anyhow!("failed to send request: {}", e))?;
+    send.finish().unwrap();
+    let response_start = Instant::now();
+    eprintln!("request sent at {:?}", response_start - start);
+    let resp = recv
+        .read_to_end(usize::MAX)
+        .await
+        .map_err(|e| anyhow!("failed to read response: {}", e))?;
+    let duration = response_start.elapsed();
+    eprintln!(
+        "response received in {:?} - {} KiB/s",
+        duration,
+        resp.len() as f32 / (duration_secs(&duration) * 1024.0)
+    );
+    io::stdout().write_all(&resp).unwrap();
+    io::stdout().flush().unwrap();
     conn.close(0u32.into(), b"done");
     eprintln!("total time from start to after close: {:?}", start.elapsed());
     eprintln!(" clock: {:?}", Utc::now());

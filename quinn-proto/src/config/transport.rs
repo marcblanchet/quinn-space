@@ -1,16 +1,6 @@
-use std::{fmt, num::TryFromIntError, sync::Arc, time::Duration};
+use std::{fmt, sync::Arc};
 
-use thiserror::Error;
-
-#[cfg(feature = "ring")]
-use rand::RngCore;
-
-use crate::{
-    cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator},
-    congestion,
-    crypto::{self, HandshakeTokenKey, HmacKey},
-    VarInt, VarIntBoundsExceeded, DEFAULT_SUPPORTED_VERSIONS, INITIAL_MTU, MAX_UDP_PAYLOAD,
-};
+use crate::{Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded, congestion};
 
 /// Parameters governing the core QUIC state machine
 ///
@@ -31,6 +21,7 @@ pub struct TransportConfig {
     pub(crate) stream_receive_window: VarInt,
     pub(crate) receive_window: VarInt,
     pub(crate) send_window: u64,
+    pub(crate) send_fairness: bool,
 
     pub(crate) packet_threshold: u32,
     pub(crate) time_threshold: f32,
@@ -75,7 +66,7 @@ impl TransportConfig {
     /// Maximum duration of inactivity to accept before timing out the connection.
     ///
     /// The true idle timeout is the minimum of this and the peer's own max idle timeout. `None`
-    /// represents an infinite timeout.
+    /// represents an infinite timeout. Defaults to 30 seconds.
     ///
     /// **WARNING**: If a peer or its network path malfunctions or acts maliciously, an infinite
     /// idle timeout can result in permanently hung futures!
@@ -131,6 +122,21 @@ impl TransportConfig {
     /// every connection uses the entire window.
     pub fn send_window(&mut self, value: u64) -> &mut Self {
         self.send_window = value;
+        self
+    }
+
+    /// Whether to implement fair queuing for send streams having the same priority.
+    ///
+    /// When enabled, connections schedule data from outgoing streams having the same priority in a
+    /// round-robin fashion. When disabled, streams are scheduled in the order they are written to.
+    ///
+    /// Note that this only affects streams with the same priority. Higher priority streams always
+    /// take precedence over lower priority streams.
+    ///
+    /// Disabling fairness can reduce fragmentation and protocol overhead for workloads that use
+    /// many small streams.
+    pub fn send_fairness(&mut self, value: bool) -> &mut Self {
+        self.send_fairness = value;
         self
     }
 
@@ -202,7 +208,9 @@ impl TransportConfig {
     /// The provided configuration will be ignored if the peer does not support the acknowledgement
     /// frequency QUIC extension.
     ///
-    /// Defaults to `None`, which disables the ACK frequency feature.
+    /// Defaults to `None`, which disables controlling the peer's acknowledgement frequency. Even
+    /// if set to `None`, the local side still supports the acknowledgement frequency QUIC
+    /// extension and may use it in other ways.
     pub fn ack_frequency_config(&mut self, value: Option<AckFrequencyConfig>) -> &mut Self {
         self.ack_frequency_config = value;
         self
@@ -312,17 +320,19 @@ impl Default for TransportConfig {
     fn default() -> Self {
         const EXPECTED_RTT: u32 = 100; // ms
         const MAX_STREAM_BANDWIDTH: u32 = 12500 * 1000; // bytes/s
-                                                        // Window size needed to avoid pipeline
-                                                        // stalls
+        // Window size needed to avoid pipeline
+        // stalls
         const STREAM_RWND: u32 = MAX_STREAM_BANDWIDTH / 1000 * EXPECTED_RTT;
 
         Self {
             max_concurrent_bidi_streams: 100u32.into(),
             max_concurrent_uni_streams: 100u32.into(),
-            max_idle_timeout: Some(VarInt(10_000)),
+            // 30 second default recommended by RFC 9308 § 3.2
+            max_idle_timeout: Some(VarInt(30_000)),
             stream_receive_window: STREAM_RWND.into(),
             receive_window: VarInt::MAX,
             send_window: (8 * STREAM_RWND).into(),
+            send_fairness: true,
 
             packet_threshold: 3,
             time_threshold: 9.0 / 8.0,
@@ -357,6 +367,7 @@ impl fmt::Debug for TransportConfig {
             stream_receive_window,
             receive_window,
             send_window,
+            send_fairness,
             packet_threshold,
             time_threshold,
             initial_rtt,
@@ -382,6 +393,7 @@ impl fmt::Debug for TransportConfig {
             .field("stream_receive_window", stream_receive_window)
             .field("receive_window", receive_window)
             .field("send_window", send_window)
+            .field("send_fairness", send_fairness)
             .field("packet_threshold", packet_threshold)
             .field("time_threshold", time_threshold)
             .field("initial_rtt", initial_rtt)
@@ -398,9 +410,9 @@ impl fmt::Debug for TransportConfig {
             .field("allow_spin", allow_spin)
             .field("datagram_receive_buffer_size", datagram_receive_buffer_size)
             .field("datagram_send_buffer_size", datagram_send_buffer_size)
-            .field("congestion_controller_factory", &"[ opaque ]")
+            // congestion_controller_factory not debug
             .field("enable_segmentation_offload", enable_segmentation_offload)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -598,383 +610,7 @@ impl Default for MtuDiscoveryConfig {
     }
 }
 
-/// Global configuration for the endpoint, affecting all connections
-///
-/// Default values should be suitable for most internet applications.
-#[derive(Clone)]
-pub struct EndpointConfig {
-    pub(crate) reset_key: Arc<dyn HmacKey>,
-    pub(crate) max_udp_payload_size: VarInt,
-    /// CID generator factory
-    ///
-    /// Create a cid generator for local cid in Endpoint struct
-    pub(crate) connection_id_generator_factory:
-        Arc<dyn Fn() -> Box<dyn ConnectionIdGenerator> + Send + Sync>,
-    pub(crate) supported_versions: Vec<u32>,
-    pub(crate) grease_quic_bit: bool,
-    /// Minimum interval between outgoing stateless reset packets
-    pub(crate) min_reset_interval: Duration,
-}
-
-impl EndpointConfig {
-    /// Create a default config with a particular `reset_key`
-    pub fn new(reset_key: Arc<dyn HmacKey>) -> Self {
-        let cid_factory: fn() -> Box<dyn ConnectionIdGenerator> =
-            || Box::<RandomConnectionIdGenerator>::default();
-        Self {
-            reset_key,
-            max_udp_payload_size: (1500u32 - 28).into(), // Ethernet MTU minus IP + UDP headers
-            connection_id_generator_factory: Arc::new(cid_factory),
-            supported_versions: DEFAULT_SUPPORTED_VERSIONS.to_vec(),
-            grease_quic_bit: true,
-            min_reset_interval: Duration::from_millis(20),
-        }
-    }
-
-    /// Supply a custom connection ID generator factory
-    ///
-    /// Called once by each `Endpoint` constructed from this configuration to obtain the CID
-    /// generator which will be used to generate the CIDs used for incoming packets on all
-    /// connections involving that  `Endpoint`. A custom CID generator allows applications to embed
-    /// information in local connection IDs, e.g. to support stateless packet-level load balancers.
-    ///
-    /// `EndpointConfig::new()` applies a default random CID generator factory. This functions
-    /// accepts any customized CID generator to reset CID generator factory that implements
-    /// the `ConnectionIdGenerator` trait.
-    pub fn cid_generator<F: Fn() -> Box<dyn ConnectionIdGenerator> + Send + Sync + 'static>(
-        &mut self,
-        factory: F,
-    ) -> &mut Self {
-        self.connection_id_generator_factory = Arc::new(factory);
-        self
-    }
-
-    /// Private key used to send authenticated connection resets to peers who were
-    /// communicating with a previous instance of this endpoint.
-    pub fn reset_key(&mut self, key: Arc<dyn HmacKey>) -> &mut Self {
-        self.reset_key = key;
-        self
-    }
-
-    /// Maximum UDP payload size accepted from peers (excluding UDP and IP overhead).
-    ///
-    /// Must be greater or equal than 1200.
-    ///
-    /// Defaults to 1472, which is the largest UDP payload that can be transmitted in the typical
-    /// 1500 byte Ethernet MTU. Deployments on links with larger MTUs (e.g. loopback or Ethernet
-    /// with jumbo frames) can raise this to improve performance at the cost of a linear increase in
-    /// datagram receive buffer size.
-    pub fn max_udp_payload_size(&mut self, value: u16) -> Result<&mut Self, ConfigError> {
-        if !(1200..=65_527).contains(&value) {
-            return Err(ConfigError::OutOfBounds);
-        }
-
-        self.max_udp_payload_size = value.into();
-        Ok(self)
-    }
-
-    /// Get the current value of `max_udp_payload_size`
-    ///
-    /// While most parameters don't need to be readable, this must be exposed to allow higher-level
-    /// layers, e.g. the `quinn` crate, to determine how large a receive buffer to allocate to
-    /// support an externally-defined `EndpointConfig`.
-    ///
-    /// While `get_` accessors are typically unidiomatic in Rust, we favor concision for setters,
-    /// which will be used far more heavily.
-    #[doc(hidden)]
-    pub fn get_max_udp_payload_size(&self) -> u64 {
-        self.max_udp_payload_size.into()
-    }
-
-    /// Override supported QUIC versions
-    pub fn supported_versions(&mut self, supported_versions: Vec<u32>) -> &mut Self {
-        self.supported_versions = supported_versions;
-        self
-    }
-
-    /// Whether to accept QUIC packets containing any value for the fixed bit
-    ///
-    /// Enabled by default. Helps protect against protocol ossification and makes traffic less
-    /// identifiable to observers. Disable if helping observers identify this traffic as QUIC is
-    /// desired.
-    pub fn grease_quic_bit(&mut self, value: bool) -> &mut Self {
-        self.grease_quic_bit = value;
-        self
-    }
-
-    /// Minimum interval between outgoing stateless reset packets
-    ///
-    /// Defaults to 20ms. Limits the impact of attacks which flood an endpoint with garbage packets,
-    /// e.g. [ISAKMP/IKE amplification]. Larger values provide a stronger defense, but may delay
-    /// detection of some error conditions by clients.
-    ///
-    /// [ISAKMP/IKE
-    /// amplification]: https://bughunters.google.com/blog/5960150648750080/preventing-cross-service-udp-loops-in-quic#isakmp-ike-amplification-vs-quic
-    pub fn min_reset_interval(&mut self, value: Duration) -> &mut Self {
-        self.min_reset_interval = value;
-        self
-    }
-}
-
-impl fmt::Debug for EndpointConfig {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt.debug_struct("EndpointConfig")
-            .field("reset_key", &"[ elided ]")
-            .field("max_udp_payload_size", &self.max_udp_payload_size)
-            .field("cid_generator_factory", &"[ elided ]")
-            .field("supported_versions", &self.supported_versions)
-            .field("grease_quic_bit", &self.grease_quic_bit)
-            .finish()
-    }
-}
-
-#[cfg(feature = "ring")]
-impl Default for EndpointConfig {
-    fn default() -> Self {
-        let mut reset_key = [0; 64];
-        rand::thread_rng().fill_bytes(&mut reset_key);
-
-        Self::new(Arc::new(ring::hmac::Key::new(
-            ring::hmac::HMAC_SHA256,
-            &reset_key,
-        )))
-    }
-}
-
-/// Parameters governing incoming connections
-///
-/// Default values should be suitable for most internet applications.
-#[derive(Clone)]
-pub struct ServerConfig {
-    /// Transport configuration to use for incoming connections
-    pub transport: Arc<TransportConfig>,
-
-    /// TLS configuration used for incoming connections.
-    ///
-    /// Must be set to use TLS 1.3 only.
-    pub crypto: Arc<dyn crypto::ServerConfig>,
-
-    /// Used to generate one-time AEAD keys to protect handshake tokens
-    pub(crate) token_key: Arc<dyn HandshakeTokenKey>,
-
-    /// Whether to require clients to prove ownership of an address before committing resources.
-    ///
-    /// Introduces an additional round-trip to the handshake to make denial of service attacks more difficult.
-    pub(crate) use_retry: bool,
-    /// Microseconds after a stateless retry token was issued for which it's considered valid.
-    pub(crate) retry_token_lifetime: Duration,
-
-    /// Maximum number of concurrent connections
-    pub(crate) concurrent_connections: u32,
-
-    /// Whether to allow clients to migrate to new addresses
-    ///
-    /// Improves behavior for clients that move between different internet connections or suffer NAT
-    /// rebinding. Enabled by default.
-    pub(crate) migration: bool,
-}
-
-impl ServerConfig {
-    /// Create a default config with a particular handshake token key
-    pub fn new(
-        crypto: Arc<dyn crypto::ServerConfig>,
-        token_key: Arc<dyn HandshakeTokenKey>,
-    ) -> Self {
-        Self {
-            transport: Arc::new(TransportConfig::default()),
-            crypto,
-
-            token_key,
-            use_retry: false,
-            retry_token_lifetime: Duration::from_secs(15),
-
-            concurrent_connections: 100_000,
-
-            migration: true,
-        }
-    }
-
-    /// Set a custom [`TransportConfig`]
-    pub fn transport_config(&mut self, transport: Arc<TransportConfig>) -> &mut Self {
-        self.transport = transport;
-        self
-    }
-
-    /// Private key used to authenticate data included in handshake tokens.
-    pub fn token_key(&mut self, value: Arc<dyn HandshakeTokenKey>) -> &mut Self {
-        self.token_key = value;
-        self
-    }
-
-    /// Whether to require clients to prove ownership of an address before committing resources.
-    ///
-    /// Introduces an additional round-trip to the handshake to make denial of service attacks more difficult.
-    pub fn use_retry(&mut self, value: bool) -> &mut Self {
-        self.use_retry = value;
-        self
-    }
-
-    /// Duration after a stateless retry token was issued for which it's considered valid.
-    pub fn retry_token_lifetime(&mut self, value: Duration) -> &mut Self {
-        self.retry_token_lifetime = value;
-        self
-    }
-
-    /// Maximum number of simultaneous connections to accept.
-    ///
-    /// New incoming connections are only accepted if the total number of incoming or outgoing
-    /// connections is less than this. Outgoing connections are unaffected.
-    pub fn concurrent_connections(&mut self, value: u32) -> &mut Self {
-        self.concurrent_connections = value;
-        self
-    }
-
-    /// Whether to allow clients to migrate to new addresses
-    ///
-    /// Improves behavior for clients that move between different internet connections or suffer NAT
-    /// rebinding. Enabled by default.
-    pub fn migration(&mut self, value: bool) -> &mut Self {
-        self.migration = value;
-        self
-    }
-}
-
-#[cfg(feature = "rustls")]
-impl ServerConfig {
-    /// Create a server config with the given certificate chain to be presented to clients
-    ///
-    /// Uses a randomized handshake token key.
-    pub fn with_single_cert(
-        cert_chain: Vec<rustls::Certificate>,
-        key: rustls::PrivateKey,
-    ) -> Result<Self, rustls::Error> {
-        let crypto = crypto::rustls::server_config(cert_chain, key)?;
-        Ok(Self::with_crypto(Arc::new(crypto)))
-    }
-}
-
-#[cfg(feature = "ring")]
-impl ServerConfig {
-    /// Create a server config with the given [`crypto::ServerConfig`]
-    ///
-    /// Uses a randomized handshake token key.
-    pub fn with_crypto(crypto: Arc<dyn crypto::ServerConfig>) -> Self {
-        let rng = &mut rand::thread_rng();
-        let mut master_key = [0u8; 64];
-        rng.fill_bytes(&mut master_key);
-        let master_key = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, &[]).extract(&master_key);
-
-        Self::new(crypto, Arc::new(master_key))
-    }
-}
-
-impl fmt::Debug for ServerConfig {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt.debug_struct("ServerConfig<T>")
-            .field("transport", &self.transport)
-            .field("crypto", &"ServerConfig { elided }")
-            .field("token_key", &"[ elided ]")
-            .field("use_retry", &self.use_retry)
-            .field("retry_token_lifetime", &self.retry_token_lifetime)
-            .field("concurrent_connections", &self.concurrent_connections)
-            .field("migration", &self.migration)
-            .finish()
-    }
-}
-
-/// Configuration for outgoing connections
-///
-/// Default values should be suitable for most internet applications.
-#[derive(Clone)]
-#[non_exhaustive]
-pub struct ClientConfig {
-    /// Transport configuration to use
-    pub transport: Arc<TransportConfig>,
-
-    /// Cryptographic configuration to use
-    pub(crate) crypto: Arc<dyn crypto::ClientConfig>,
-
-    /// QUIC protocol version to use
-    pub(crate) version: u32,
-}
-
-impl ClientConfig {
-    /// Create a default config with a particular cryptographic config
-    pub fn new(crypto: Arc<dyn crypto::ClientConfig>) -> Self {
-        Self {
-            transport: Default::default(),
-            crypto,
-            version: 1,
-        }
-    }
-
-    /// Set a custom [`TransportConfig`]
-    pub fn transport_config(&mut self, transport: Arc<TransportConfig>) -> &mut Self {
-        self.transport = transport;
-        self
-    }
-
-    /// Set the QUIC version to use
-    pub fn version(&mut self, version: u32) -> &mut Self {
-        self.version = version;
-        self
-    }
-}
-
-#[cfg(feature = "rustls")]
-impl ClientConfig {
-    /// Create a client configuration that trusts the platform's native roots
-    #[cfg(feature = "platform-verifier")]
-    pub fn with_platform_verifier() -> Self {
-        let mut cfg = rustls::ClientConfig::builder()
-            .with_safe_default_cipher_suites()
-            .with_safe_default_kx_groups()
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_custom_certificate_verifier(Arc::new(rustls_platform_verifier::Verifier::new()))
-            .with_no_client_auth();
-        cfg.enable_early_data = true;
-        Self::new(Arc::new(cfg))
-    }
-
-    /// Create a client configuration that trusts specified trust anchors
-    pub fn with_root_certificates(roots: rustls::RootCertStore) -> Self {
-        Self::new(Arc::new(crypto::rustls::client_config(roots)))
-    }
-}
-
-impl fmt::Debug for ClientConfig {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt.debug_struct("ClientConfig<T>")
-            .field("transport", &self.transport)
-            .field("crypto", &"ClientConfig { elided }")
-            .field("version", &self.version)
-            .finish()
-    }
-}
-
-/// Errors in the configuration of an endpoint
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ConfigError {
-    /// Value exceeds supported bounds
-    #[error("value exceeds supported bounds")]
-    OutOfBounds,
-}
-
-impl From<TryFromIntError> for ConfigError {
-    fn from(_: TryFromIntError) -> Self {
-        Self::OutOfBounds
-    }
-}
-
-impl From<VarIntBoundsExceeded> for ConfigError {
-    fn from(_: VarIntBoundsExceeded) -> Self {
-        Self::OutOfBounds
-    }
-}
-
-/// Maximum duration of inactivity to accept before timing out the connection.
+/// Maximum duration of inactivity to accept before timing out the connection
 ///
 /// This wraps an underlying [`VarInt`], representing the duration in milliseconds. Values can be
 /// constructed by converting directly from `VarInt`, or using `TryFrom<Duration>`.
