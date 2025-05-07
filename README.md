@@ -9,6 +9,13 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE-MIT)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE-APACHE)
 
+## ABOUT THIS FORK
+This fork adds cli arguments to examples/client.rs,server.rs to support large delays,
+such as in space. See argument --dtn. 
+It also implements an almost null congestion control (see congestion/no_cc.rs).
+
+## Quinn 
+
 Quinn is a pure-Rust, async-compatible implementation of the IETF [QUIC][quic] transport protocol.
 The project was founded by [Dirkjan Ochtman](https://github.com/djc) and
 [Benjamin Saunders](https://github.com/Ralith) as a side project in 2018, and has seen more than
