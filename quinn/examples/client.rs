@@ -203,35 +203,42 @@ async fn run(options: Opt) -> Result<()> {
         .await
         .map_err(|e| anyhow!("failed to connect: {}", e))?;
     eprintln!("connected at {:?}", start.elapsed());
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| anyhow!("failed to open stream: {}", e))?;
-    if rebind {
-        let socket = std::net::UdpSocket::bind("[::]:0").unwrap();
-        let addr = socket.local_addr().unwrap();
-        eprintln!("rebinding to {addr}");
-        endpoint.rebind(socket).expect("rebind failed");
+    eprintln!(" clock: {:?}", Utc::now());
+    let mut repeat = 1;
+    if let Some(repeating) = options.repeat { repeat = repeating; }
+    for n in 0..repeat {
+        eprintln!(" sending request #{} to remote at: {:?}", n, Utc::now());
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow!("failed to open stream: {}", e))?;
+        if rebind {
+            let socket = std::net::UdpSocket::bind("[::]:0").unwrap();
+            let addr = socket.local_addr().unwrap();
+            eprintln!("rebinding to {addr}");
+            endpoint.rebind(socket).expect("rebind failed");
+        }
+        send.write_all(request.as_bytes())
+            .await
+            .map_err(|e| anyhow!("failed to send request: {}", e))?;
+        send.finish().unwrap();
+        let response_start = Instant::now();
+        eprintln!("request sent at {:?}", response_start - start);
+        let resp = recv
+            .read_to_end(usize::MAX)
+            .await
+            .map_err(|e| anyhow!("failed to read response: {}", e))?;
+        let duration = response_start.elapsed();
+        eprintln!(
+            "response received in {:?} - {} KiB/s",
+            duration,
+            resp.len() as f32 / (duration_secs(&duration) * 1024.0)
+        );
+        io::stdout().write_all(&resp).unwrap();
+        io::stdout().flush().unwrap();
+        eprintln!(" clock: {:?}", Utc::now());
     }
 
-    send.write_all(request.as_bytes())
-        .await
-        .map_err(|e| anyhow!("failed to send request: {}", e))?;
-    send.finish().unwrap();
-    let response_start = Instant::now();
-    eprintln!("request sent at {:?}", response_start - start);
-    let resp = recv
-        .read_to_end(usize::MAX)
-        .await
-        .map_err(|e| anyhow!("failed to read response: {}", e))?;
-    let duration = response_start.elapsed();
-    eprintln!(
-        "response received in {:?} - {} KiB/s",
-        duration,
-        resp.len() as f32 / (duration_secs(&duration) * 1024.0)
-    );
-    io::stdout().write_all(&resp).unwrap();
-    io::stdout().flush().unwrap();
     conn.close(0u32.into(), b"done");
     eprintln!("total time from start to after close: {:?}", start.elapsed());
     eprintln!(" clock: {:?}", Utc::now());
