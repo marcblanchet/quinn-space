@@ -81,6 +81,10 @@ struct Opt {
     //to simulate a single connection with multiple http requests: repeat the same request
     #[clap(long = "repeat")]
     repeat: Option<u32>,
+
+    //to interop with other stacks, define the alpn
+    #[clap(long = "alpn")]
+    alpn:  Option<String>,
 }
 
 fn main() {
@@ -134,7 +138,11 @@ async fn run(options: Opt) -> Result<()> {
         //.with_root_certificates(roots)
         .with_no_client_auth();
 
-    client_crypto.alpn_protocols = common::ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
+    if let Some(alpn) = options.alpn {
+        client_crypto.alpn_protocols = vec![alpn.as_bytes().to_vec()];
+    } else {
+        client_crypto.alpn_protocols = common::ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
+    }
     if options.keylog {
         client_crypto.key_log = Arc::new(rustls::KeyLogFile::new());
     }
