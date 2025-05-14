@@ -22,6 +22,7 @@ use proto::congestion::NoCCConfig;
 use proto::{AckFrequencyConfig, MtuDiscoveryConfig, TransportConfig};
 use proto::{VarInt};
 use chrono::Utc;
+use tokio::time::sleep;
 
 mod common;
 
@@ -51,26 +52,27 @@ struct Opt {
     #[clap(long = "bind", default_value = "[::]:0")]
     bind: SocketAddr,
 
-    // sets the congestion control methods. Since cubic is default, options are:
-    // "bbr" or "none".
-    // The "none" means a cc algo which does no congestion control... (deep space use case)
+    /// sets the congestion control methods. Since cubic is default, options are:
+    /// "bbr" or "none".
+    /// The "none" means a cc algo which does no congestion control... (deep space use case)
     #[clap(long = "cc")]
     cc: Option<String>,
 
-    // sets max_idle_timeout to a very large value
+    /// sets max_idle_timeout to a very large value
     #[clap(long = "large_max_idle_timeout")]
     large_max_idle_timeout: bool,
 
-    // window size
+    /// window size in bytes
     #[clap(long = "window")]
     window: Option<u32>,
 
+    /// sets the initial rtt in ms
     #[clap(long = "initial_rtt")]
     initial_rtt: Option<u64>,
 
 
-    // sets many transport config parameters to very large values (such as ::MAX) to handle
-    // deep space usage, where delays and disruptions can be in order of minutes, hours, days
+    /// sets many transport config parameters to very large values (such as ::MAX) to handle
+    /// deep space usage, where delays and disruptions can be in order of minutes, hours, days
     #[clap(long = "dtn")]
     dtn: bool,
 
@@ -78,11 +80,15 @@ struct Opt {
     #[clap(long = "insecure")]
     insecure: bool,
 
-    //to simulate a single connection with multiple http requests: repeat the same request
+    /// to simulate a single connection with multiple http requests: repeat the same request
     #[clap(long = "repeat")]
     repeat: Option<u32>,
 
-    //to interop with other stacks, define the alpn
+    /// interval in seconds between repeats
+    #[clap(long = "repeat-interval")]
+    repeat_interval: Option<u64>,
+
+    /// to interop with other stacks, define the alpn
     #[clap(long = "alpn")]
     alpn:  Option<String>,
 }
@@ -214,6 +220,8 @@ async fn run(options: Opt) -> Result<()> {
     eprintln!(" clock: {:?}", Utc::now());
     let mut repeat = 1;
     if let Some(repeating) = options.repeat { repeat = repeating; }
+    let mut repeat_interval = 0;
+    if let Some(repeating_interval) = options.repeat_interval { repeat_interval = repeating_interval; }
     for n in 0..repeat {
         eprintln!(" sending request #{} to remote at: {:?}", n, Utc::now());
         let (mut send, mut recv) = conn
@@ -225,6 +233,9 @@ async fn run(options: Opt) -> Result<()> {
             let addr = socket.local_addr().unwrap();
             eprintln!("rebinding to {addr}");
             endpoint.rebind(socket).expect("rebind failed");
+        }
+        if n > 0 && repeat_interval > 0 {
+            sleep(Duration::from_secs(repeat_interval)).await;
         }
         send.write_all(request.as_bytes())
             .await
