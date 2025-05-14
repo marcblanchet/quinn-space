@@ -70,6 +70,10 @@ struct Opt {
     // deep space usage, where delays and disruptions can be in order of minutes, hours, days
     #[clap(long = "dtn")]
     dtn: bool,
+
+    //to interop with other stacks, define the alpn
+    #[clap(long = "alpn")]
+    alpn:  Option<String>
 }
 
 fn main() {
@@ -143,7 +147,11 @@ async fn run(options: Opt) -> Result<()> {
     let mut server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
-    server_crypto.alpn_protocols = common::ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
+    if let Some(alpn) = options.alpn {
+        server_crypto.alpn_protocols = vec![alpn.as_bytes().to_vec()];
+    } else {
+        server_crypto.alpn_protocols = common::ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
+    }
     if options.keylog {
         server_crypto.key_log = Arc::new(rustls::KeyLogFile::new());
     }
