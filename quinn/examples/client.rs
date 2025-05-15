@@ -8,7 +8,7 @@ use std::{
     net::{SocketAddr, ToSocketAddrs},
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Instant},
 };
 
 use anyhow::{Result, anyhow};
@@ -22,7 +22,8 @@ use proto::congestion::NoCCConfig;
 use proto::{AckFrequencyConfig, MtuDiscoveryConfig, TransportConfig};
 use proto::{VarInt};
 use chrono::Utc;
-use tokio::time::sleep;
+use tokio::time::{interval, Duration, MissedTickBehavior};
+use quinn::{Connection, Endpoint};
 
 mod common;
 
@@ -206,8 +207,8 @@ async fn run(options: Opt) -> Result<()> {
     let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())?;
     endpoint.set_default_client_config(client_config);
 
-    let request = format!("GET {}\r\n", url.path());
     let start = Instant::now();
+    let request = format!("GET {}\r\n", url.path());
     let rebind = options.rebind;
     let host = options.host.as_deref().unwrap_or(url_host);
 
@@ -216,46 +217,33 @@ async fn run(options: Opt) -> Result<()> {
         .connect(remote, host)?
         .await
         .map_err(|e| anyhow!("failed to connect: {}", e))?;
+    let conn = Arc::new(conn);
+    let request = Arc::new(request);
+    let endpoint = Arc::new(endpoint);
+
     eprintln!("connected at {:?}", start.elapsed());
     eprintln!(" clock: {:?}", Utc::now());
     let mut repeat = 1;
     if let Some(repeating) = options.repeat { repeat = repeating; }
     let mut repeat_interval = 0;
     if let Some(repeating_interval) = options.repeat_interval { repeat_interval = repeating_interval; }
+
+    let mut ticker = interval(Duration::from_secs(repeat_interval));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
     for n in 0..repeat {
-        eprintln!(" sending request #{} to remote at: {:?}", n, Utc::now());
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| anyhow!("failed to open stream: {}", e))?;
-        if rebind {
-            let socket = std::net::UdpSocket::bind("[::]:0").unwrap();
-            let addr = socket.local_addr().unwrap();
-            eprintln!("rebinding to {addr}");
-            endpoint.rebind(socket).expect("rebind failed");
-        }
-        if n > 0 && repeat_interval > 0 {
-            sleep(Duration::from_secs(repeat_interval)).await;
-        }
-        send.write_all(request.as_bytes())
-            .await
-            .map_err(|e| anyhow!("failed to send request: {}", e))?;
-        send.finish().unwrap();
-        let response_start = Instant::now();
-        eprintln!("request sent at {:?}", response_start - start);
-        let resp = recv
-            .read_to_end(usize::MAX)
-            .await
-            .map_err(|e| anyhow!("failed to read response: {}", e))?;
-        let duration = response_start.elapsed();
-        eprintln!(
-            "response received in {:?} - {} KiB/s",
-            duration,
-            resp.len() as f32 / (duration_secs(&duration) * 1024.0)
-        );
-        io::stdout().write_all(&resp).unwrap();
-        io::stdout().flush().unwrap();
-        eprintln!(" clock: {:?}", Utc::now());
+        let conn = conn.clone();
+        let request = request.clone();
+        let endpoint = endpoint.clone();
+        let rebind = rebind;
+
+        tokio::spawn(async move {
+            eprintln!(" sending request #{} to remote at: {:?}", n, Utc::now());
+            if let Err(e) = perform_request(conn, request, endpoint, rebind, start).await {
+                eprintln!("Request failed: {:?}", e);
+            }
+        });
+        ticker.tick().await;
     }
 
     conn.close(0u32.into(), b"done");
@@ -268,6 +256,48 @@ async fn run(options: Opt) -> Result<()> {
     eprintln!(" clock: {:?}", Utc::now());
     Ok(())
 }
+
+async fn perform_request(conn: Arc<Connection>, request: Arc<String>, endpoint: Arc<Endpoint>, rebind: bool, start: Instant) -> Result<()> {
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow!("failed to open stream: {}", e))?;
+    if rebind {
+        let socket = std::net::UdpSocket::bind("[::]:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        eprintln!("rebinding to {addr}");
+        endpoint.rebind(socket).expect("rebind failed");
+    }
+
+    send.write_all(request.as_bytes())
+        .await
+        .map_err(|e| anyhow!("failed to send request: {}", e))?;
+
+    send.finish()
+        .map_err(|e| anyhow!("failed to finish stream: {}", e))?;
+
+    let response_start = Instant::now();
+    eprintln!("request sent at {:?}", response_start - start);
+
+    let resp = recv
+        .read_to_end(usize::MAX)
+        .await
+        .map_err(|e| anyhow!("failed to read response: {}", e))?;
+
+    let duration = response_start.elapsed();
+    eprintln!(
+        "response received in {:?} - {} KiB/s",
+        duration,
+        resp.len() as f32 / (duration_secs(&duration) * 1024.0)
+    );
+    io::stdout().write_all(&resp)?;
+    io::stdout().flush()?;
+    eprintln!("duration: {:?}", duration);
+    eprintln!("clock: {:?}", Utc::now());
+    Ok(())
+}
+
+
 
 fn strip_ipv6_brackets(host: &str) -> &str {
     // An ipv6 url looks like eg https://[::1]:4433/Cargo.toml, wherein the host [::1] is the
