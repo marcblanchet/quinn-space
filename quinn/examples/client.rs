@@ -212,6 +212,7 @@ async fn run(options: Opt) -> Result<()> {
     let rebind = options.rebind;
     let host = options.host.as_deref().unwrap_or(url_host);
 
+    eprintln!("clock: {:?}", Utc::now());
     eprintln!("connecting to {host} at {remote}");
     let conn = endpoint
         .connect(remote, host)?
@@ -222,7 +223,7 @@ async fn run(options: Opt) -> Result<()> {
     let endpoint = Arc::new(endpoint);
 
     eprintln!("connected at {:?}", start.elapsed());
-    eprintln!(" clock: {:?}", Utc::now());
+    eprintln!("clock: {:?}", Utc::now());
     let mut repeat = 1;
     if let Some(repeating) = options.repeat { repeat = repeating; }
     let mut repeat_interval = 0;
@@ -248,13 +249,13 @@ async fn run(options: Opt) -> Result<()> {
 
     conn.close(0u32.into(), b"done");
     eprintln!("total time from start to after close: {:?}", start.elapsed());
-    eprintln!(" clock: {:?}", Utc::now());
+    eprintln!("clock: {:?}", Utc::now());
 
     // Give the server a fair chance to receive the close packet
-    eprintln!("pausing to let server close. waiting idle_timeout");
-    endpoint.wait_idle().await;
-    eprintln!("paused to let server close. ending now");
-    eprintln!(" clock: {:?}", Utc::now());
+    // eprintln!("pausing to let server close. waiting idle_timeout");
+    //endpoint.wait_idle().await;
+    //eprintln!("paused to let server close. ending now");
+    //eprintln!("clock: {:?}", Utc::now());
     Ok(())
 }
 
