@@ -239,7 +239,7 @@ async fn run(options: Opt) -> Result<()> {
 
         tokio::spawn(async move {
             eprintln!(" sending request #{} to remote at: {:?}", n, Utc::now());
-            if let Err(e) = perform_request(conn, request, endpoint, rebind, start).await {
+            if let Err(e) = perform_request(conn, request, endpoint, rebind, n).await {
                 eprintln!("Request failed: {:?}", e);
             }
         });
@@ -251,13 +251,14 @@ async fn run(options: Opt) -> Result<()> {
     eprintln!(" clock: {:?}", Utc::now());
 
     // Give the server a fair chance to receive the close packet
+    eprintln!("pausing to let server close. waiting idle_timeout");
     endpoint.wait_idle().await;
     eprintln!("paused to let server close. ending now");
     eprintln!(" clock: {:?}", Utc::now());
     Ok(())
 }
 
-async fn perform_request(conn: Arc<Connection>, request: Arc<String>, endpoint: Arc<Endpoint>, rebind: bool, start: Instant) -> Result<()> {
+async fn perform_request(conn: Arc<Connection>, request: Arc<String>, endpoint: Arc<Endpoint>, rebind: bool, n: u32) -> Result<()> {
     let (mut send, mut recv) = conn
         .open_bi()
         .await
@@ -269,31 +270,34 @@ async fn perform_request(conn: Arc<Connection>, request: Arc<String>, endpoint: 
         endpoint.rebind(socket).expect("rebind failed");
     }
 
+    let start = Instant::now();
+    eprintln!("request #{}: sending at {:?}", n, start);
+
     send.write_all(request.as_bytes())
         .await
-        .map_err(|e| anyhow!("failed to send request: {}", e))?;
+        .map_err(|e| anyhow!("failed to send request #{}: {}", n, e))?;
 
     send.finish()
-        .map_err(|e| anyhow!("failed to finish stream: {}", e))?;
+        .map_err(|e| anyhow!("failed to finish stream of request #{}: {}", n, e))?;
 
     let response_start = Instant::now();
-    eprintln!("request sent at {:?}", response_start - start);
+    eprintln!("request #{} sent at {:?}", n, response_start);
 
     let resp = recv
         .read_to_end(usize::MAX)
         .await
         .map_err(|e| anyhow!("failed to read response: {}", e))?;
 
-    let duration = response_start.elapsed();
+    let duration = start.elapsed();
     eprintln!(
-        "response received in {:?} - {} KiB/s",
-        duration,
-        resp.len() as f32 / (duration_secs(&duration) * 1024.0)
+        "request #{}: response for  received in {:?} from request start",
+        n,
+        duration
     );
     io::stdout().write_all(&resp)?;
     io::stdout().flush()?;
-    eprintln!("duration: {:?}", duration);
-    eprintln!("clock: {:?}", Utc::now());
+    eprintln!("request #{}: duration: {:?}", n, duration);
+    eprintln!("request #{}: clock: {:?}", n, Utc::now());
     Ok(())
 }
 
@@ -309,9 +313,9 @@ fn strip_ipv6_brackets(host: &str) -> &str {
     }
 }
 
-fn duration_secs(x: &Duration) -> f32 {
-    x.as_secs() as f32 + x.subsec_nanos() as f32 * 1e-9
-}
+//fn duration_secs(x: &Duration) -> f32 {
+//    x.as_secs() as f32 + x.subsec_nanos() as f32 * 1e-9
+//}
 
 // copied from insecure_connection.rs. no it is not the right way to do this, but for now, fast enabling testing.
 //
