@@ -272,7 +272,7 @@ async fn perform_request(conn: Arc<Connection>, request: Arc<String>, endpoint: 
     }
 
     let start = Instant::now();
-    eprintln!("request #{}: sending at {:?}", n, start);
+    eprintln!("request #{}: sending at {:?}", n, Utc::now());
 
     send.write_all(request.as_bytes())
         .await
@@ -281,8 +281,7 @@ async fn perform_request(conn: Arc<Connection>, request: Arc<String>, endpoint: 
     send.finish()
         .map_err(|e| anyhow!("failed to finish stream of request #{}: {}", n, e))?;
 
-    let response_start = Instant::now();
-    eprintln!("request #{} sent at {:?}", n, response_start);
+    eprintln!("request #{} sent at {:?}", n, Utc::now());
 
     let resp = recv
         .read_to_end(usize::MAX)
@@ -291,7 +290,7 @@ async fn perform_request(conn: Arc<Connection>, request: Arc<String>, endpoint: 
 
     let duration = start.elapsed();
     eprintln!(
-        "request #{}: response for  received in {:?} from request start",
+        "request #{}: response received in {:?} from request start",
         n,
         duration
     );
