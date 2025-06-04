@@ -17,7 +17,7 @@ use proto::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tracing::{error, info};
 use url::Url;
-use proto::congestion::BbrConfig;
+use proto::congestion::{BbrConfig, CubicConfig};
 use proto::congestion::NoCCConfig;
 use proto::{AckFrequencyConfig, MtuDiscoveryConfig, TransportConfig};
 use proto::{VarInt};
@@ -188,6 +188,10 @@ async fn run(options: Opt) -> Result<()> {
         // should use match but can't get it to work with String vs &str.
         if cc == "bbr" {
             transport_config.congestion_controller_factory(Arc::new(BbrConfig::default()));
+        } else if cc == "cubic" {
+            let mut cubic_config = CubicConfig::default();
+            cubic_config.initial_window(100000000);
+            transport_config.congestion_controller_factory(Some(cubic_config));
         } else if cc == "none" {
             transport_config.congestion_controller_factory(Arc::new(NoCCConfig::default()));
         }
