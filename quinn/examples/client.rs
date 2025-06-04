@@ -67,10 +67,9 @@ struct Opt {
     #[clap(long = "window")]
     window: Option<u32>,
 
-    /// window size in bytes
-    #[clap(long = "ccwindow")]
+    /// congestion initial window size in bytes passed to cc
+    #[clap(long = "cc_initial_window")]
     ccwindow: Option<u64>,
-
 
     /// sets the initial rtt in ms
     #[clap(long = "initial_rtt")]
@@ -203,7 +202,6 @@ async fn run(options: Opt) -> Result<()> {
             transport_config.congestion_controller_factory(Arc::new(bbr_config));
         } else if cc == "cubic" {
             let mut cubic_config = CubicConfig::default();
-            // static value for initial testing, we shall pass on as argument, or the estimated bdp
             cubic_config.initial_window(window);
             transport_config.congestion_controller_factory(Arc::new(cubic_config));
         } else if cc == "none" {
