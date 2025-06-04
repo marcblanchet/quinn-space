@@ -154,6 +154,8 @@ async fn run(options: Opt) -> Result<()> {
         client_crypto.key_log = Arc::new(rustls::KeyLogFile::new());
     }
 
+    //TODO: we shall pass on an estimated BDP for the path and then use it for proper calculations
+    //  instead of maxing everything
     let mut client_config =
         quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto)?));
     //let mut endpoint = quinn::Endpoint::client(options.bind)?;
@@ -190,8 +192,9 @@ async fn run(options: Opt) -> Result<()> {
             transport_config.congestion_controller_factory(Arc::new(BbrConfig::default()));
         } else if cc == "cubic" {
             let mut cubic_config = CubicConfig::default();
+            // static value for initial testing, we shall pass on as argument, or the estimated bdp
             cubic_config.initial_window(100000000);
-            transport_config.congestion_controller_factory(Some(cubic_config));
+            transport_config.congestion_controller_factory(Arc::new(cubic_config));
         } else if cc == "none" {
             transport_config.congestion_controller_factory(Arc::new(NoCCConfig::default()));
         }
