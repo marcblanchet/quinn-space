@@ -67,6 +67,11 @@ struct Opt {
     #[clap(long = "window")]
     window: Option<u32>,
 
+    /// window size in bytes
+    #[clap(long = "ccwindow")]
+    ccwindow: Option<u64>,
+
+
     /// sets the initial rtt in ms
     #[clap(long = "initial_rtt")]
     initial_rtt: Option<u64>,
@@ -188,12 +193,18 @@ async fn run(options: Opt) -> Result<()> {
      }
     if let Some(cc) = options.cc {
         // should use match but can't get it to work with String vs &str.
+        let mut window = 100000000;
+        if let Some(ccwin) = options.ccwindow {
+            window = ccwin;
+        }
         if cc == "bbr" {
-            transport_config.congestion_controller_factory(Arc::new(BbrConfig::default()));
+            let mut bbr_config = BbrConfig::default();
+            bbr_config.initial_window(window);
+            transport_config.congestion_controller_factory(Arc::new(bbr_config));
         } else if cc == "cubic" {
             let mut cubic_config = CubicConfig::default();
             // static value for initial testing, we shall pass on as argument, or the estimated bdp
-            cubic_config.initial_window(100000000);
+            cubic_config.initial_window(window);
             transport_config.congestion_controller_factory(Arc::new(cubic_config));
         } else if cc == "none" {
             transport_config.congestion_controller_factory(Arc::new(NoCCConfig::default()));
